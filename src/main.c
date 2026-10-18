@@ -1,3 +1,5 @@
+#include "util.c"
+
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -6,7 +8,6 @@
 #include <msi.h>
 #include <winnt.h>
 #include <wincrypt.h>
-
 
 /// data:    Pointer to where to put the data pointer.
 /// len:     Pointer to where to put the data length.
@@ -105,6 +106,47 @@ uint64_t rva_get_file_offset(uint32_t rva, const PIMAGE_SECTION_HEADER section_h
 	return 0;
 }
 
+// Returns TRUE if the file specified by `path` has a valid certificate and
+// Microsoft is the root signer. (It's supposed to anyway, I'm not good with
+// certificates and stuff.)
+// TODO: Confirm that this fails when a file with an invalid signature (e.g.
+// with a hash mismatch) is passed.
+BOOL valid_microsoft_root_cert(const char *path) {
+	PCCERT_CONTEXT cert;
+	if (MsiGetFileSignatureInformation(path, 0, &cert, NULL, NULL) != S_OK) return FALSE;
+
+	PCCERT_CHAIN_CONTEXT chain;
+	CERT_CHAIN_POLICY_STATUS status;
+	if (!CertGetCertificateChain(
+		NULL,
+		cert,
+		NULL,
+		cert->hCertStore,
+		&(CERT_CHAIN_PARA) {
+			.cbSize = sizeof(CERT_CHAIN_PARA)
+		},
+		0,
+		NULL,
+		&chain
+	)) {
+		CertFreeCertificateContext(cert);
+		return FALSE;
+	}
+
+	BOOL call_success = CertVerifyCertificateChainPolicy(
+		CERT_CHAIN_POLICY_MICROSOFT_ROOT,
+		chain,
+		&(CERT_CHAIN_POLICY_PARA) {
+			.cbSize = sizeof(CERT_CHAIN_POLICY_PARA)
+		},
+		&status
+	);
+
+	CertFreeCertificateChain(chain);
+	CertFreeCertificateContext(cert);
+	return call_success && status.dwError == S_OK;
+}
+
 enum {
 	KERNEL32_SUSSYBAKAS_IDX_CreateRemoteThread = 0,
 	KERNEL32_SUSSYBAKAS_IDX_CreateRemoteThreadEx,
@@ -163,7 +205,9 @@ BOOL get_kernel32_ordinals_inner(uint16_t *ordinals, const uint8_t *data) {
 /// ordinals: Pointer (of length KERNEL32_SUSSYBAKAS_MAX) to where to put the ordinal numbers.
 /// Returns TRUE if successful.
 BOOL get_kernel32_ordinals(uint16_t *ordinals) {
-	const char path[] = "C:\\Windows\\System32\\KERNEL32.DLL";
+	const char path[] = "C:\\Windows\\System32\\KERNEL32.DLL";	
+	if (!valid_microsoft_root_cert(path)) return FALSE;
+
 	const uint8_t *data;
 	int64_t len;
 	HANDLE mapping;
@@ -341,21 +385,6 @@ BOOL file_is_sus(const char *path, const uint16_t *kernel32_ordinals) {
 	return FALSE;
 }
 
-uint32_t print_win_err(uint32_t err, const char *fmt, ...) {
-	va_list args;
-	va_start(args, fmt);
-	vprintf(fmt, args);
-	va_end(args);
-
-	const char *msg;
-	uint32_t flags = FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_IGNORE_INSERTS;
-	if (FormatMessage(flags, NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (char *)&msg, 0, NULL))
-		printf(". Error code: 0x%x, %s", err, msg);	
-	else
-		printf(". Error code: 0x%x.\n", err);
-	return err;
-}
-
 typedef struct {
 	char *path;
 	HANDLE find;
@@ -412,10 +441,7 @@ int main(int argc, char **argv) {
 				// prev_path == "path/*" => new_path == "path/dir/*".
 				// prev_path == "path"   => new_path == "path/*" (== "dir/*").
 				if (prev_path[prev_path_len - 1] == '*') {
-					// NOTE: `+sizeof("/*")` could probably be replaced with `+2`,
-					// but since it's just 1 extra byte anyway we might aswell
-					// to avoid OOB access in some edgecase I didn't think of or something.
-					find_stack[ext_depth].path = malloc(prev_path_len + dir_name_len + sizeof("/*"));
+					find_stack[ext_depth].path = malloc(prev_path_len + dir_name_len + sizeof("/"));
 					memcpy(find_stack[ext_depth].path, prev_path, prev_path_len);
 					memcpy(find_stack[ext_depth].path + prev_path_len - 1, dir_name, dir_name_len);
 					memcpy(find_stack[ext_depth].path + prev_path_len - 1 + dir_name_len, "/*", 3);
