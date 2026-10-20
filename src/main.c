@@ -147,6 +147,7 @@ BOOL valid_microsoft_root_cert(const char *path) {
 	return call_success && status.dwError == S_OK;
 }
 
+// TODO: VirtualAllocEx (and maybe others) stems from a different DLL. Detect it as an import from that DLL instead of kernel32.
 enum {
 	KERNEL32_SUSSYBAKAS_IDX_CreateRemoteThread = 0,
 	KERNEL32_SUSSYBAKAS_IDX_CreateRemoteThreadEx,
@@ -221,6 +222,7 @@ BOOL get_kernel32_ordinals(uint16_t *ordinals) {
 }
 
 /// Helper function for pe_is_sus.
+/// TODO: Also check imports from imported DLLs.
 BOOL imports_are_sus(
 	const uint8_t *data,
 	uint64_t len,
