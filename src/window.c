@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <winuser.h>
+#define ID_BUTTON 1
 
 typedef struct {
     BOOL running;
@@ -15,7 +16,18 @@ LRESULT windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)  {
 
     switch (msg) {
         case WM_CLOSE:
+            DestroyWindow(wind);
+            break;
+
+        case WM_DESTROY:
             windowAnti.running = FALSE;
+            PostQuitMessage(0);
+            break;
+        case WM_COMMAND:
+            if (LOWORD(wp) == ID_BUTTON){
+                MessageBoxA(wind, "System scan started!",
+                            "Hedda Defender", MB_OK | MB_ICONINFORMATION);
+            }
         break;
 
         default:
@@ -45,12 +57,23 @@ int main() {
         0, 0, GetModuleHandle(0),0
     );
 
+    HWND button = CreateWindowExA(
+        0,
+        "Button",
+        "Scan System",
+        WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+        20, 20, 120, 35,
+        wind,
+        (HMENU)(INT_PTR)ID_BUTTON,
+        GetModuleHandle(0),
+        NULL
+    );
+
     while (windowAnti.running) {
-        MSG msg = {};
-        while (PeekMessage(&msg, wind, 0, 0, PM_REMOVE) > 0) {
+        MSG msg;
+        while (GetMessage(&msg, NULL, 0, 0) > 0 ){
             TranslateMessage(&msg);
             DispatchMessage(&msg);
-
         }
     }
 }
