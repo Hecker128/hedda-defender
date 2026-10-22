@@ -1,15 +1,16 @@
 #define WIN32_LEAN_AND_MEAN
+#include "main.c"
 #include <windows.h>
 #include <math.h>
 
-#define ID_TIMER 2
-#define SCAN_DURATION 35000
+#define ID_TIMER_GUI 2
+#define ID_TIMER_SCAN_UPDATE 3
 
+static HANDLE scanThread = NULL;
 static BOOL scanning = FALSE;
 static BOOL hovering = FALSE;
 static BOOL pressed = FALSE;
 static int frame = 0;
-static DWORD scanStart = 0;
 
 static RECT getButtonRect(const RECT *rect)
 {
@@ -234,7 +235,7 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_DESTROY:
-        KillTimer(wind, ID_TIMER);
+        KillTimer(wind, ID_TIMER_GUI);
         PostQuitMessage(0);
         return 0;
 
@@ -300,10 +301,13 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
             ReleaseCapture();
 
             if (PtInRect(&buttonRect, point) && !scanning) {
+		if (scanThread != NULL) return 0;
+                scanThread = create_scan_thread("C:");
+		if (scanThread == NULL) return 0;
                 scanning = TRUE;
                 frame = 0;
-                scanStart = GetTickCount();
-                SetTimer(wind, ID_TIMER, 60, NULL);
+                SetTimer(wind, ID_TIMER_GUI, 60, NULL);
+                SetTimer(wind, ID_TIMER_SCAN_UPDATE, 1000, NULL);
             }
 
             InvalidateRect(wind, NULL, FALSE);
@@ -312,24 +316,31 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
         break;
 
     case WM_TIMER:
-        if (wp == ID_TIMER && scanning) {
-            if (GetTickCount() - scanStart >= SCAN_DURATION) {
-                scanning = FALSE;
-                KillTimer(wind, ID_TIMER);
+        if (wp == ID_TIMER_GUI && scanning) {
+            ++frame;
+	    InvalidateRect(wind, NULL, FALSE);
+        } else if (wp == ID_TIMER_SCAN_UPDATE && scanning) {
+            if (WaitForSingleObject(scan_result_mutex, INFINITE) == WAIT_OBJECT_0) {
+	        scanning = scan_result.is_scanning;
+                if (!ReleaseMutex(scan_result_mutex)) {
+                    puts("Failed to release mutex");
+        	    return 0;
+                }
+            }
+            if (scanning == FALSE) {
+                KillTimer(wind, ID_TIMER_GUI);
+                KillTimer(wind, ID_TIMER_SCAN_UPDATE);
+		CloseHandle(scanThread);
 
                 InvalidateRect(wind, NULL, FALSE);
-
                 MessageBoxA(
                     wind,
                     "Scanning Complete",
                     "Scanning Files",
                     MB_OK | MB_ICONINFORMATION
                 );
-            } else {
-                ++frame;
-                InvalidateRect(wind, NULL, FALSE);
-            }
-        }
+	    }
+	}
         return 0;
 
     case WM_SIZE:
@@ -415,6 +426,11 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
 
 int main(void)
 {
+    if (!init_scanner()) {
+        puts("Failed to init scanner");
+        return 1;
+    }
+
     WNDCLASSA wc = {0};
 
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);

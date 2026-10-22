@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <windows.h>
 #include <msi.h>
@@ -241,7 +242,7 @@ BOOL imports_are_sus(
 		if (len < lib_name_off) continue;
 		const char *lib_name = (char *)(data + lib_name_off);
 
-		if (strnicmp(lib_name, "KERNEL32.DLL", len - lib_name_off) != 0) continue;
+		if (_strnicmp(lib_name, "KERNEL32.DLL", len - lib_name_off) != 0) continue;
 
 		uint64_t ilt_off = rva_get_file_offset(import->OriginalFirstThunk, section_heads, n_sections);
 		if (len < ilt_off) continue;
@@ -367,15 +368,15 @@ BOOL file_is_sus(const char *path, const uint16_t *kernel32_ordinals) {
 		return TRUE;
 	}
 
-	uint8_t hash[32];
-	if (!sha256_hash(hash, data, len)) {
-		puts("Failed to hash file (suspicious)!");
-		unmap_file(data, mapping, file);
-		return TRUE;
-	}
-	printf("SHA-256 hash: ");
-	for (int i = 0; i < 32; printf("%.2x", hash[i++]));
-	putchar('\n');
+	////uint8_t hash[32];
+	////if (!sha256_hash(hash, data, len)) {
+	////	puts("Failed to hash file (suspicious)!");
+	////	unmap_file(data, mapping, file);
+	////	return TRUE;
+	////}
+	////printf("SHA-256 hash: ");
+	////for (int i = 0; i < 32; printf("%.2x", hash[i++]));
+	////putchar('\n');
 
 	if (pe_is_sus(data, len, kernel32_ordinals)) {
 		puts("File is suspicious.");
@@ -393,26 +394,48 @@ typedef struct {
 	WIN32_FIND_DATA data;
 } FindInfo;
 
-int main(int argc, char **argv) {
+typedef struct {
+	uint64_t n_scanned;
+	uint64_t n_sus;
+	BOOL is_scanning;
+} ScanResult;
+
+HANDLE scan_result_mutex = NULL;
+ScanResult scan_result = {
+	.n_scanned = 0,
+	.n_sus = 0,
+	.is_scanning = FALSE,
+};
+
+BOOL init_scanner() {
+	scan_result_mutex = CreateMutex(NULL, FALSE, NULL);
+	if (scan_result_mutex == NULL) {
+		print_win_err(GetLastError(), "Failed to create mutex for scan result");
+		return FALSE;
+	}
+	return TRUE;
+}
+
+// Do not call this directly. Use create_scan_thread instead.
+DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
+	const char *path = lpParam;
+
+	// TODO: Maybe move this to main.
 	uint16_t kernel32_ordinals[KERNEL32_SUSSYBAKAS_MAX];
-	if (!get_kernel32_ordinals(kernel32_ordinals)) return 2;
+	if (!get_kernel32_ordinals(kernel32_ordinals)) return 1;
 
-	uint64_t n_scanned = 0;
-	uint64_t n_sus = 0;
-
-	if (argc != 2) return 1;
 	FindInfo *find_stack = malloc(sizeof(FindInfo));
-	size_t path_len = strlen(argv[1]);
+	size_t path_len = strlen(path);
 	if (path_len == 0) return 1;
-	if (strcmp(argv[1], ".") == 0 || strcmp(argv[1], "..") == 0) {
+	if (strcmp(path, ".") == 0 || strcmp(path, "..") == 0) {
 		// "."  => "./*".
 		// ".." => "../*".
 		find_stack[0].path = malloc(path_len + sizeof("/*"));
-		memcpy(find_stack[0].path, argv[1], path_len);
+		memcpy(find_stack[0].path, path, path_len);
 		memcpy(find_stack[0].path + path_len, "/*", 3);
 	} else {
 		find_stack[0].path = malloc(path_len + 1);
-		memcpy(find_stack[0].path, argv[1], path_len + 1);
+		memcpy(find_stack[0].path, path, path_len + 1);
 	}
 	find_stack[0].find = FindFirstFile(find_stack[0].path, &find_stack[0].data);
 	if (find_stack[0].find == INVALID_HANDLE_VALUE) {
@@ -420,8 +443,10 @@ int main(int argc, char **argv) {
 		if (err == ERROR_ACCESS_DENIED) {
 			puts("Not scanning any files because access was denied.");
 			goto skip_scan;
-		} else
-			return print_win_err(err, "Failed to find file (in %s)", find_stack[0].path);
+		} else {
+			print_win_err(err, "Failed to find file (in %s)", find_stack[0].path);
+			return 1;
+		}
 	}
 	int ext_depth = 0;
 	for (;;) {
@@ -459,8 +484,10 @@ int main(int argc, char **argv) {
 					if (err == ERROR_ACCESS_DENIED) {
 						printf("Skipping file(s) \"%s\" because access was denied.\n", find_stack[ext_depth].path);
 						break;
-					} else
-						return print_win_err(err, "Failed to find file (in %s)", find_stack[ext_depth].path);
+					} else {
+						print_win_err(err, "Failed to find file (in %s)", find_stack[ext_depth].path);
+						return 1;
+					}
 				}
 
 				goto check_first_find;
@@ -480,8 +507,12 @@ int main(int argc, char **argv) {
 				} else
 					path_has_wild = FALSE;
 
-				if (file_is_sus(find->path, kernel32_ordinals)) n_sus += 1;
-				n_scanned += 1;
+				if (WaitForSingleObject(scan_result_mutex, INFINITE) == WAIT_OBJECT_0) {
+					if (file_is_sus(find->path, kernel32_ordinals)) scan_result.n_sus += 1;
+					scan_result.n_scanned += 1;
+
+					if (!ReleaseMutex(scan_result_mutex)) return 1;
+				}
 
 				// "path" => "path/*"
 				// "file" => "file"
@@ -499,6 +530,26 @@ int main(int argc, char **argv) {
 	}
 	skip_scan:
 
-	printf("%llu files scanned.\n", n_scanned);
-	printf("Found %llu suspicious files.\n", n_sus);
+	if (WaitForSingleObject(scan_result_mutex, INFINITE) == WAIT_OBJECT_0) {
+		scan_result.is_scanning = FALSE;
+
+		if (!ReleaseMutex(scan_result_mutex)) return 1;
+	}
+
+	puts("Scanned successfully");
+	return 0;
+}
+
+// Returns the handle to the created thread, which should be passed to CloseHandle after scan_result.is_scanning goes from TRUE to FALSE.
+HANDLE create_scan_thread(char *path) {
+	if (scan_result_mutex == NULL) return NULL;
+
+	if (WaitForSingleObject(scan_result_mutex, INFINITE) == WAIT_OBJECT_0) {
+		scan_result.is_scanning = TRUE;
+
+		if (!ReleaseMutex(scan_result_mutex)) return NULL;
+	}
+
+	DWORD _tid;
+	return CreateThread(NULL, 0, scan_thread_routine, path, 0, &_tid);
 }
