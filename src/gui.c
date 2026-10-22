@@ -12,6 +12,19 @@ static BOOL scanning = FALSE;
 static int frame = 0;
 static DWORD scanStart = 0;
 
+/*
+ * Uncomment this when we are ready to run a real scan.
+ *
+ * #include <stdlib.h>
+ * #include <stdio.h>
+ *
+ * int result = system("yara64.exe YARA\\APT_Blackenergy.yar sample.exe");
+ * if (result == -1) {
+ *     perror("Failed to execute YARA");
+ * }
+ *
+ */
+
 static void drawGradient(HDC hdc, const RECT *rect)
 {
     int height = rect->bottom - rect->top;
@@ -259,6 +272,13 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
                 ShowWindow(button, SW_SHOW);
                 InvalidateRect(button, NULL, TRUE);
                 InvalidateRect(wind, NULL, FALSE);
+
+                MessageBoxA(
+                    wind,
+                    "Scanning Complete",
+                    "Scanning Files",
+                    MB_OK | MB_ICONINFORMATION
+                );
             } else {
                 ++frame;
                 InvalidateRect(wind, NULL, FALSE);
