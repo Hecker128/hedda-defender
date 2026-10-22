@@ -2,7 +2,18 @@
 #include <stdio.h>
 #include <windows.h>
 
+// NOTE: This variable doesn't have an associated mutex for performance
+// reasons, so don't access it from the main thread while the scan thread is
+// running.
+BOOL logging_enabled = FALSE;
+
+#define LOG_PUTS(msg) if (logging_enabled) { puts(msg); }
+#define LOG_PRINTF(msg, ...) if (logging_enabled) { printf(msg, __VA_ARGS__); }
+#define LOG_PUTCHAR(msg, ...) if (logging_enabled) { putchar(msg); }
+
 uint32_t print_win_err(uint32_t err, const char *fmt, ...) {
+	if (!logging_enabled) return err;
+
 	va_list args;
 	va_start(args, fmt);
 	vprintf(fmt, args);

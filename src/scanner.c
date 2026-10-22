@@ -10,6 +10,12 @@
 #include <winnt.h>
 #include <wincrypt.h>
 
+////#define USE_YARA // Undefine to use hedda-defender without YARA.
+
+#ifdef USE_YARA
+# include <yara.h>
+#endif
+
 /// data:    Pointer to where to put the data pointer.
 /// len:     Pointer to where to put the data length.
 /// mapping: Pointer to where to put the mapping handle.
@@ -266,11 +272,11 @@ BOOL imports_are_sus(
 
 			if (is_ordinal) {
 				uint16_t ordinal = ilt_entry32 & 0xffff;
-				printf("Import by ordinal: 0x%hx.\n", ordinal);
+				LOG_PRINTF("Import by ordinal: 0x%hx.\n", ordinal);
 
 				for (int i = 0; i < KERNEL32_SUSSYBAKAS_MAX; i++)
 					if (ordinal == kernel32_ordinals[i]) {
-						puts("Suspicious by-ordinal import found!");
+						LOG_PUTS("Suspicious by-ordinal import found!");
 						return TRUE;
 					}
 			} else {
@@ -279,11 +285,11 @@ BOOL imports_are_sus(
 				if (len - by_name_off < sizeof(IMAGE_IMPORT_BY_NAME)) continue;
 				if (by_name_off == 0) continue;
 				const PIMAGE_IMPORT_BY_NAME by_name = (PIMAGE_IMPORT_BY_NAME)(data + by_name_off);
-				printf("Import by name: Hint: 0x%hx, Name: %.*s\n", by_name->Hint, (int)(len - by_name_name_off), by_name->Name);
+				LOG_PRINTF("Import by name: Hint: 0x%hx, Name: %.*s\n", by_name->Hint, (int)(len - by_name_name_off), by_name->Name);
 
 				for (int i = 0; i < KERNEL32_SUSSYBAKAS_MAX; i++)
 					if (strncmp(by_name->Name, kernel32_sus_names[i], len - by_name_name_off) == 0) {
-						puts("Suspicious by-name import found!");
+						LOG_PUTS("Suspicious by-name import found!");
 						return TRUE;
 					}
 			}
@@ -304,24 +310,24 @@ BOOL imports_are_sus(
 /// flagged as suspicious).
 BOOL pe_is_sus(const uint8_t *data, uint64_t len, const uint16_t *kernel32_ordinals) {
 	if (len < sizeof(IMAGE_DOS_HEADER)) {
-		puts("Not an MZ file (with PE Extension): Not big enough for IMAGE_DOS_HEADER.");
+		LOG_PUTS("Not an MZ file (with PE Extension): Not big enough for IMAGE_DOS_HEADER.");
 		return FALSE;
 	}
 	const PIMAGE_DOS_HEADER dos_header = (PIMAGE_DOS_HEADER)data;
 	if (dos_header->e_magic != 0x5A4D) {
-		puts("Not an MZ file: Wrong e_magic.");
+		LOG_PUTS("Not an MZ file: Wrong e_magic.");
 		return FALSE;
 	}
 
 	// NOTE: At this point we don't know if it's 32-bit or 64-bit yet.
 	// Before we do, we'll only use the common fields.
 	if (len - dos_header->e_lfanew < sizeof(IMAGE_NT_HEADERS32)) {
-		puts("Not a PE file: IMAGE_NT_HEADERS32 doesn't fit.");
+		LOG_PUTS("Not a PE file: IMAGE_NT_HEADERS32 doesn't fit.");
 		return FALSE;
 	}
 	const PIMAGE_NT_HEADERS32 nt_heads32 = (PIMAGE_NT_HEADERS32)(data + dos_header->e_lfanew);
 	if (nt_heads32->Signature != 0x4550) {
-		printf("Not a PE file: Wrong NT headers signature (0x%lx).\n", nt_heads32->Signature);
+		LOG_PRINTF("Not a PE file: Wrong NT headers signature (0x%lx).\n", nt_heads32->Signature);
 		return FALSE;
 	}
 	uint16_t n_sections = nt_heads32->FileHeader.NumberOfSections;
@@ -339,7 +345,7 @@ BOOL pe_is_sus(const uint8_t *data, uint64_t len, const uint16_t *kernel32_ordin
 		data_dirs = nt_heads64->OptionalHeader.DataDirectory;
 		break;
 	} default: {
-		puts("Not a PE file for Windows.");
+		LOG_PUTS("Not a PE file for Windows.");
 		return FALSE;
 	}}
 
@@ -350,7 +356,7 @@ BOOL pe_is_sus(const uint8_t *data, uint64_t len, const uint16_t *kernel32_ordin
 	for (uint16_t i = 0; i < n_sections; i++) {
 		if (len - section_heads[i].PointerToRawData < section_heads[i].SizeOfRawData) continue;
 		if (data_get_entropy(data + section_heads[i].PointerToRawData, section_heads[i].SizeOfRawData) > 7) {
-			puts("Section has suspiciously high entropy!");
+			LOG_PUTS("Section has suspiciously high entropy!");
 			return TRUE;
 		}
 	}
@@ -364,22 +370,22 @@ BOOL file_is_sus(const char *path, const uint16_t *kernel32_ordinals) {
 	HANDLE mapping;
 	HANDLE file;
 	if (!map_file(&data, &len, &mapping, &file, path)) {
-		puts("Failed to map file (suspicious)!");
+		LOG_PUTS("Failed to map file (suspicious)!");
 		return TRUE;
 	}
 
 	////uint8_t hash[32];
 	////if (!sha256_hash(hash, data, len)) {
-	////	puts("Failed to hash file (suspicious)!");
+	////	LOG_PUTS("Failed to hash file (suspicious)!");
 	////	unmap_file(data, mapping, file);
 	////	return TRUE;
 	////}
-	////printf("SHA-256 hash: ");
-	////for (int i = 0; i < 32; printf("%.2x", hash[i++]));
-	////putchar('\n');
+	////LOG_PRINTF("SHA-256 hash: ");
+	////for (int i = 0; i < 32; LOG_PRINTF("%.2x", hash[i++]));
+	////LOG_PUTCHAR('\n');
 
 	if (pe_is_sus(data, len, kernel32_ordinals)) {
-		puts("File is suspicious.");
+		LOG_PUTS("File is suspicious.");
 		unmap_file(data, mapping, file);
 		return TRUE;
 	}
@@ -395,16 +401,20 @@ typedef struct {
 } FindInfo;
 
 typedef struct {
+	uint64_t n_total;
 	uint64_t n_scanned;
 	uint64_t n_sus;
 	BOOL is_scanning;
+	BOOL is_counting_files;
 } ScanResult;
 
 HANDLE scan_result_mutex = NULL;
 ScanResult scan_result = {
+	.n_total = 0,
 	.n_scanned = 0,
 	.n_sus = 0,
 	.is_scanning = FALSE,
+	.is_counting_files = FALSE,
 };
 
 BOOL init_scanner() {
@@ -416,17 +426,34 @@ BOOL init_scanner() {
 	return TRUE;
 }
 
-// Do not call this directly. Use create_scan_thread instead.
+#ifdef USE_YARA
+/// Leaks memory on failure.
+BOOL init_yara() {
+	//...
+}
+
+void cleanup_yara() {
+	//...
+}
+#endif
+
+/// Do not call this directly. Use create_scan_thread instead.
 DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
 	const char *path = lpParam;
 
-	// TODO: Maybe move this to main.
 	uint16_t kernel32_ordinals[KERNEL32_SUSSYBAKAS_MAX];
 	if (!get_kernel32_ordinals(kernel32_ordinals)) return 1;
+
+#ifdef USE_YARA
+	if (!init_yara()) return 1;
+#endif
 
 	FindInfo *find_stack = malloc(sizeof(FindInfo));
 	size_t path_len = strlen(path);
 	if (path_len == 0) return 1;
+
+	find_files:
+
 	if (strcmp(path, ".") == 0 || strcmp(path, "..") == 0) {
 		// "."  => "./*".
 		// ".." => "../*".
@@ -441,7 +468,7 @@ DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
 	if (find_stack[0].find == INVALID_HANDLE_VALUE) {
 		uint32_t err = GetLastError();
 		if (err == ERROR_ACCESS_DENIED) {
-			puts("Not scanning any files because access was denied.");
+			LOG_PUTS("Not scanning any files because access was denied.");
 			goto skip_scan;
 		} else {
 			print_win_err(err, "Failed to find file (in %s)", find_stack[0].path);
@@ -454,7 +481,7 @@ DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
 		do {
 			if (find_stack[ext_depth].data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
 				const char *dir_name = find_stack[ext_depth].data.cFileName;
-				////printf("DIR (level %d): %s\n", ext_depth, dir_name);
+				////LOG_PRINTF("DIR (level %d): %s\n", ext_depth, dir_name);
 				if (strcmp(dir_name, ".") == 0 || strcmp(dir_name, "..") == 0) continue;
 				if (find_stack[ext_depth].data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT
 						&& find_stack[ext_depth].data.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT) continue;
@@ -482,11 +509,11 @@ DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
 				if (find_stack[ext_depth].find == INVALID_HANDLE_VALUE) {
 					uint32_t err = GetLastError();
 					if (err == ERROR_ACCESS_DENIED) {
-						printf("Skipping file(s) \"%s\" because access was denied.\n", find_stack[ext_depth].path);
+						LOG_PRINTF("Skipping file(s) \"%s\" because access was denied.\n", find_stack[ext_depth].path);
 						break;
 					} else {
 						print_win_err(err, "Failed to find file (in %s)", find_stack[ext_depth].path);
-						return 1;
+						break;
 					}
 				}
 
@@ -508,9 +535,12 @@ DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
 					path_has_wild = FALSE;
 
 				if (WaitForSingleObject(scan_result_mutex, INFINITE) == WAIT_OBJECT_0) {
-					if (file_is_sus(find->path, kernel32_ordinals)) scan_result.n_sus += 1;
-					scan_result.n_scanned += 1;
-
+					if (scan_result.is_counting_files)
+						scan_result.n_total += 1;
+					else {
+						if (file_is_sus(find->path, kernel32_ordinals)) scan_result.n_sus += 1;
+						scan_result.n_scanned += 1;
+					}
 					if (!ReleaseMutex(scan_result_mutex)) return 1;
 				}
 
@@ -531,12 +561,19 @@ DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
 	skip_scan:
 
 	if (WaitForSingleObject(scan_result_mutex, INFINITE) == WAIT_OBJECT_0) {
-		scan_result.is_scanning = FALSE;
+		BOOL was_counting_files = scan_result.is_counting_files;
+		if (was_counting_files)
+			scan_result.is_counting_files = FALSE;
+		else
+			scan_result.is_scanning = FALSE;
 
 		if (!ReleaseMutex(scan_result_mutex)) return 1;
+		if (was_counting_files) goto find_files;
 	}
-
-	puts("Scanned successfully");
+#ifdef USE_YARA
+	cleanup_yara();
+#endif
+	LOG_PUTS("Scanned successfully");
 	return 0;
 }
 
@@ -545,7 +582,11 @@ HANDLE create_scan_thread(char *path) {
 	if (scan_result_mutex == NULL) return NULL;
 
 	if (WaitForSingleObject(scan_result_mutex, INFINITE) == WAIT_OBJECT_0) {
+		scan_result.n_total = 0;
+		scan_result.n_scanned = 0;
+		scan_result.n_sus = 0;
 		scan_result.is_scanning = TRUE;
+		scan_result.is_counting_files = TRUE;
 
 		if (!ReleaseMutex(scan_result_mutex)) return NULL;
 	}
