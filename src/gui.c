@@ -1,9 +1,15 @@
+
+
 #define WIN32_LEAN_AND_MEAN
-#include "scanner.c"
+
 #include <windows.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <math.h>
 
-#define ID_TIMER_GUI 2
+#include "scanner.c"
+
+#define ID_TIMER_GUI         2
 #define ID_TIMER_SCAN_UPDATE 3
 
 static HANDLE scanThread = NULL;
@@ -12,22 +18,38 @@ static BOOL hovering = FALSE;
 static BOOL pressed = FALSE;
 static int frame = 0;
 
+static DWORD scanStartTime = 0;
+static uint64_t scannedFiles = 0;
+static uint64_t totalFiles = 0;
+
 static RECT getButtonRect(const RECT *rect)
 {
     int width = rect->right - rect->left;
     int height = rect->bottom - rect->top;
+
     int diameter = width < height ? width / 5 : height / 5;
 
-    if (diameter > 160) diameter = 160;
-    if (diameter < 120) diameter = 120;
-    if (diameter > width - 20) diameter = width - 20;
-    if (diameter > height - 20) diameter = height - 20;
-    if (diameter < 1) diameter = 1;
+    if (diameter > 160)
+        diameter = 160;
+
+    if (diameter > width - 20)
+        diameter = width - 20;
+
+    if (diameter > height - 20)
+        diameter = height - 20;
+
+    if (diameter < 1)
+        diameter = 1;
 
     int x = (width - diameter) / 2;
     int y = (height - diameter) / 2;
 
-    RECT result = { x, y, x + diameter, y + diameter };
+    RECT result = {
+        x, y,
+        x + diameter,
+        y + diameter
+    };
+
     return result;
 }
 
@@ -51,45 +73,32 @@ static void drawGradient(HDC hdc, const RECT *rect)
         int g = (int)(240 - 25 * t);
         int b = (int)(247 - 10 * t);
 
-        HPEN pen = CreatePen(PS_SOLID, 1, RGB(r, g, b));
+        HPEN pen = CreatePen(
+            PS_SOLID,
+            1,
+            RGB(r, g, b)
+        );
+
         if (!pen)
             continue;
 
         HPEN oldPen = (HPEN)SelectObject(hdc, pen);
-        MoveToEx(hdc, rect->left, rect->top + y, NULL);
-        LineTo(hdc, rect->right, rect->top + y);
+
+        MoveToEx(
+            hdc,
+            rect->left,
+            rect->top + y,
+            NULL
+        );
+
+        LineTo(
+            hdc,
+            rect->right,
+            rect->top + y
+        );
+
         SelectObject(hdc, oldPen);
         DeleteObject(pen);
-    }
-}
-
-static void drawSpinner(HDC hdc, int cx, int cy, int currentFrame)
-{
-    const int dots = 12;
-    const int radius = 24;
-    const int dotSize = 7;
-    HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
-
-    for (int i = 0; i < dots; ++i) {
-        double angle = (i + currentFrame) * 6.28318530718 / dots;
-        int x = cx + (int)(cos(angle) * radius);
-        int y = cy + (int)(sin(angle) * radius);
-        int brightness = 70 + i * 185 / dots;
-
-        HBRUSH brush = CreateSolidBrush(RGB(40, brightness, 255));
-        if (!brush)
-            continue;
-
-        HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
-        HPEN oldPen = (HPEN)SelectObject(hdc, nullPen);
-
-        Ellipse(hdc,
-                x - dotSize / 2, y - dotSize / 2,
-                x + dotSize / 2, y + dotSize / 2);
-
-        SelectObject(hdc, oldBrush);
-        SelectObject(hdc, oldPen);
-        DeleteObject(brush);
     }
 }
 
@@ -110,15 +119,90 @@ static void drawTitle(HDC hdc, const RECT *rect)
         return;
 
     HFONT oldFont = (HFONT)SelectObject(hdc, font);
-    RECT titleRect = { 20, 35, rect->right - 20, 85 };
+
+    RECT titleRect = {
+        20, 35,
+        rect->right - 20, 85
+    };
 
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, RGB(40, 45, 65));
-    DrawTextA(hdc, "Hedda Defender", -1, &titleRect,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    DrawTextA(
+        hdc,
+        "Hedda Defender",
+        -1,
+        &titleRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE
+    );
 
     SelectObject(hdc, oldFont);
     DeleteObject(font);
+}
+
+static void drawSpinner(
+    HDC hdc,
+    int cx,
+    int cy,
+    int currentFrame
+)
+{
+    const int dots = 12;
+    const int radius = 24;
+    const int dotSize = 7;
+
+    HPEN nullPen = (HPEN)GetStockObject(NULL_PEN);
+
+    for (int i = 0; i < dots; ++i) {
+        double angle =
+            (i + currentFrame) * 6.28318530718 / dots;
+
+        int x = cx + (int)(cos(angle) * radius);
+        int y = cy + (int)(sin(angle) * radius);
+
+        int brightness = 70 + i * 185 / dots;
+
+        HBRUSH brush = CreateSolidBrush(
+            RGB(40, brightness, 255)
+        );
+
+        if (!brush)
+            continue;
+
+        HBRUSH oldBrush =
+            (HBRUSH)SelectObject(hdc, brush);
+
+        HPEN oldPen =
+            (HPEN)SelectObject(hdc, nullPen);
+
+        Ellipse(
+            hdc,
+            x - dotSize / 2,
+            y - dotSize / 2,
+            x + dotSize / 2,
+            y + dotSize / 2
+        );
+
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+
+        DeleteObject(brush);
+    }
+}
+
+static void formatTime(DWORD seconds, char *buffer, size_t size)
+{
+    unsigned long minutes = seconds / 60;
+    unsigned long remaining = seconds % 60;
+
+    _snprintf_s(
+        buffer,
+        size,
+        _TRUNCATE,
+        "%lu:%02lu",
+        minutes,
+        remaining
+    );
 }
 
 static void drawScanStatus(HDC hdc, const RECT *rect)
@@ -126,7 +210,78 @@ static void drawScanStatus(HDC hdc, const RECT *rect)
     int cx = (rect->left + rect->right) / 2;
     int cy = (rect->top + rect->bottom) / 2;
 
+    DWORD elapsedSeconds =
+        (GetTickCount() - scanStartTime) / 1000;
+
+    int percentage = 0;
+    DWORD remainingSeconds = 0;
+
+    if (totalFiles > 0) {
+        percentage = (int)(
+            (double)scannedFiles * 100.0 / (double)totalFiles
+        );
+
+        if (percentage > 100)
+            percentage = 100;
+
+        if (scannedFiles > 0 && scannedFiles < totalFiles) {
+            double secondsPerFile =
+                (double)elapsedSeconds / (double)scannedFiles;
+
+            double estimate =
+                secondsPerFile * (double)(totalFiles - scannedFiles);
+
+            if (estimate > 0xFFFFFFFFu)
+                estimate = 0xFFFFFFFFu;
+
+            remainingSeconds = (DWORD)estimate;
+        }
+    }
+
     drawSpinner(hdc, cx, cy - 25, frame);
+
+    HFONT percentFont = CreateFontA(
+        20, 0, 0, 0, FW_BOLD,
+        FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_DONTCARE,
+        "Segoe UI"
+    );
+
+    if (percentFont) {
+        HFONT oldFont =
+            (HFONT)SelectObject(hdc, percentFont);
+
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(40, 45, 65));
+
+        char percentText[16];
+
+        if (totalFiles > 0) {
+            wsprintfA(percentText, "%d%%", percentage);
+        } else {
+            lstrcpyA(percentText, "...");
+        }
+
+        RECT percentRect = {
+            cx - 25, cy - 38,
+            cx + 25, cy - 12
+        };
+
+        DrawTextA(
+            hdc,
+            percentText,
+            -1,
+            &percentRect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE
+        );
+
+        SelectObject(hdc, oldFont);
+        DeleteObject(percentFont);
+    }
 
     HFONT font = CreateFontA(
         15, 0, 0, 0, FW_SEMIBOLD,
@@ -139,37 +294,90 @@ static void drawScanStatus(HDC hdc, const RECT *rect)
         "Segoe UI"
     );
 
-    HFONT oldFont = NULL;
-    if (font)
-        oldFont = (HFONT)SelectObject(hdc, font);
+    if (!font)
+        return;
+
+    HFONT oldFont = (HFONT)SelectObject(hdc, font);
 
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, RGB(40, 45, 65));
 
-    RECT textRect = { cx - 140, cy + 20, cx + 140, cy + 55 };
-    DrawTextA(hdc, "Scanning...", -1, &textRect,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    RECT statusRect = {
+        cx - 180, cy + 20,
+        cx + 180, cy + 45
+    };
 
-    if (font) {
-        SelectObject(hdc, oldFont);
-        DeleteObject(font);
+    DrawTextA(
+        hdc,
+        "Scanning...",
+        -1,
+        &statusRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE
+    );
+
+    char elapsedText[32];
+    char remainingText[32];
+    char timeText[128];
+
+    formatTime(
+        elapsedSeconds,
+        elapsedText,
+        sizeof(elapsedText)
+    );
+
+    if (totalFiles > 0 && scannedFiles > 0) {
+        formatTime(
+            remainingSeconds,
+            remainingText,
+            sizeof(remainingText)
+        );
+    } else {
+        lstrcpyA(remainingText, "--:--");
     }
+
+    _snprintf_s(
+        timeText,
+        sizeof(timeText),
+        _TRUNCATE,
+        "Elapsed: %s    Remaining: %s",
+        elapsedText,
+        remainingText
+    );
+
+    RECT timeRect = {
+        cx - 200, cy + 45,
+        cx + 200, cy + 72
+    };
+
+    DrawTextA(
+        hdc,
+        timeText,
+        -1,
+        &timeRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE
+    );
+
+    SelectObject(hdc, oldFont);
+    DeleteObject(font);
 }
 
 static void drawStartButton(HDC hdc, const RECT *rect)
 {
     RECT r = getButtonRect(rect);
+
     int width = r.right - r.left;
     int height = r.bottom - r.top;
+
     int cx = (r.left + r.right) / 2;
     int cy = (r.top + r.bottom) / 2;
 
     COLORREF color = RGB(0, 190, 85);
 
-    if (pressed)
+    if (pressed) {
         color = RGB(0, 140, 65);
-    else if (hovering)
+    } else if (hovering) {
         color = RGB(0, 220, 100);
+    }
 
     POINT triangle[3] = {
         { r.left + width / 8, r.top + height / 10 },
@@ -181,8 +389,11 @@ static void drawStartButton(HDC hdc, const RECT *rect)
     HPEN pen = CreatePen(PS_NULL, 0, color);
 
     if (brush && pen) {
-        HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, brush);
-        HPEN oldPen = (HPEN)SelectObject(hdc, pen);
+        HBRUSH oldBrush =
+            (HBRUSH)SelectObject(hdc, brush);
+
+        HPEN oldPen =
+            (HPEN)SelectObject(hdc, pen);
 
         Polygon(hdc, triangle, 3);
 
@@ -192,6 +403,7 @@ static void drawStartButton(HDC hdc, const RECT *rect)
 
     if (brush)
         DeleteObject(brush);
+
     if (pen)
         DeleteObject(pen);
 
@@ -206,36 +418,55 @@ static void drawStartButton(HDC hdc, const RECT *rect)
         "Segoe UI"
     );
 
-    if (font) {
-        HFONT oldFont = (HFONT)SelectObject(hdc, font);
+    if (!font)
+        return;
 
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, RGB(0, 0, 0));
+    HFONT oldFont = (HFONT)SelectObject(hdc, font);
 
-        RECT textRect = {
-            cx - width / 2.5,
-            cy - 15,
-            cx + width / 5,
-            cy + 15
-        };
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(0, 0, 0));
 
-        DrawTextA(hdc, "Start", -1, &textRect,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    RECT textRect = {
+        cx - width / 3,
+        cy - 15,
+        cx + width / 3,
+        cy + 15
+    };
 
-        SelectObject(hdc, oldFont);
-        DeleteObject(font);
-    }
+    DrawTextA(
+        hdc,
+        "Start",
+        -1,
+        &textRect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE
+    );
+
+    SelectObject(hdc, oldFont);
+    DeleteObject(font);
 }
 
-static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
+static LRESULT CALLBACK windProc(
+    HWND wind,
+    UINT msg,
+    WPARAM wp,
+    LPARAM lp
+)
 {
     switch (msg) {
+
     case WM_CLOSE:
         DestroyWindow(wind);
         return 0;
 
     case WM_DESTROY:
         KillTimer(wind, ID_TIMER_GUI);
+        KillTimer(wind, ID_TIMER_SCAN_UPDATE);
+
+        if (scanThread != NULL) {
+            CloseHandle(scanThread);
+            scanThread = NULL;
+        }
+
         PostQuitMessage(0);
         return 0;
 
@@ -244,41 +475,54 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_MOUSEMOVE:
         if (!scanning) {
+            TRACKMOUSEEVENT track = {
+                sizeof(TRACKMOUSEEVENT),
+                TME_LEAVE,
+                wind,
+                0
+            };
+
+            TrackMouseEvent(&track);
+
             RECT rect;
-            POINT point = { LOWORD(lp), HIWORD(lp) };
             GetClientRect(wind, &rect);
 
-            BOOL newHover = pointInButton(point, &(RECT){
-                getButtonRect(&rect).left,
-                getButtonRect(&rect).top,
-                getButtonRect(&rect).right,
-                getButtonRect(&rect).bottom
-            });
+            POINT point = {
+                (short)LOWORD(lp),
+                (short)HIWORD(lp)
+            };
+
+            RECT buttonRect = getButtonRect(&rect);
+
+            BOOL newHover =
+                pointInButton(point, &buttonRect);
 
             if (newHover != hovering) {
                 hovering = newHover;
                 InvalidateRect(wind, NULL, FALSE);
             }
-
-            if (!hovering && !pressed)
-                break;
-
-            TRACKMOUSEEVENT track = { sizeof(track), TME_LEAVE, wind, 0 };
-            TrackMouseEvent(&track);
         }
+
         return 0;
 
     case WM_MOUSELEAVE:
         hovering = FALSE;
+
         if (!pressed)
             InvalidateRect(wind, NULL, FALSE);
+
         return 0;
 
     case WM_LBUTTONDOWN:
         if (!scanning) {
             RECT rect;
-            POINT point = { LOWORD(lp), HIWORD(lp) };
             GetClientRect(wind, &rect);
+
+            POINT point = {
+                (short)LOWORD(lp),
+                (short)HIWORD(lp)
+            };
+
             RECT buttonRect = getButtonRect(&rect);
 
             if (PtInRect(&buttonRect, point)) {
@@ -288,24 +532,69 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
                 return 0;
             }
         }
+
         break;
 
     case WM_LBUTTONUP:
         if (pressed) {
             RECT rect;
-            POINT point = { LOWORD(lp), HIWORD(lp) };
             GetClientRect(wind, &rect);
+
+            POINT point = {
+                (short)LOWORD(lp),
+                (short)HIWORD(lp)
+            };
+
             RECT buttonRect = getButtonRect(&rect);
 
             pressed = FALSE;
             ReleaseCapture();
 
             if (PtInRect(&buttonRect, point) && !scanning) {
-		if (scanThread != NULL) return 0;
+                if (scanThread != NULL)
+                    return 0;
+
+                DWORD waitResult = WaitForSingleObject(
+                    scan_result_mutex,
+                    INFINITE
+                );
+
+                if (waitResult != WAIT_OBJECT_0 &&
+                    waitResult != WAIT_ABANDONED) {
+                    MessageBoxA(
+                        wind,
+                        "Could not access scan results.",
+                        "Hedda Defender",
+                        MB_OK | MB_ICONERROR
+                    );
+                    return 0;
+                }
+
+                scan_result.n_scanned = 0;
+                scan_result.n_sus = 0;
+                scan_result.n_total = 0;
+
+                ReleaseMutex(scan_result_mutex);
+
+                scannedFiles = 0;
+                totalFiles = 0;
+                scanStartTime = GetTickCount();
+
                 scanThread = create_scan_thread("C:");
-		if (scanThread == NULL) return 0;
+
+                if (scanThread == NULL) {
+                    MessageBoxA(
+                        wind,
+                        "Could not start the scanner.",
+                        "Hedda Defender",
+                        MB_OK | MB_ICONERROR
+                    );
+                    return 0;
+                }
+
                 scanning = TRUE;
                 frame = 0;
+
                 SetTimer(wind, ID_TIMER_GUI, 60, NULL);
                 SetTimer(wind, ID_TIMER_SCAN_UPDATE, 1000, NULL);
             }
@@ -313,35 +602,57 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
             InvalidateRect(wind, NULL, FALSE);
             return 0;
         }
+
         break;
 
     case WM_TIMER:
         if (wp == ID_TIMER_GUI && scanning) {
             ++frame;
-	    InvalidateRect(wind, NULL, FALSE);
-        } else if (wp == ID_TIMER_SCAN_UPDATE && scanning) {
-            if (WaitForSingleObject(scan_result_mutex, INFINITE) == WAIT_OBJECT_0) {
-	        scanning = scan_result.is_scanning;
-                if (!ReleaseMutex(scan_result_mutex)) {
-                    puts("Failed to release mutex");
-        	    return 0;
-                }
-            }
-            if (scanning == FALSE) {
-                KillTimer(wind, ID_TIMER_GUI);
-                KillTimer(wind, ID_TIMER_SCAN_UPDATE);
-		CloseHandle(scanThread);
+            InvalidateRect(wind, NULL, FALSE);
+            return 0;
+        }
+
+        if (wp == ID_TIMER_SCAN_UPDATE && scanning) {
+            DWORD waitResult = WaitForSingleObject(
+                scan_result_mutex,
+                INFINITE
+            );
+
+            if (waitResult == WAIT_OBJECT_0 ||
+                waitResult == WAIT_ABANDONED) {
+
+                scanning = scan_result.is_scanning;
+                scannedFiles = scan_result.n_scanned;
+                totalFiles = scan_result.n_total;
+
+                ReleaseMutex(scan_result_mutex);
 
                 InvalidateRect(wind, NULL, FALSE);
-                MessageBoxA(
-                    wind,
-                    "Scanning Complete",
-                    "Scanning Files",
-                    MB_OK | MB_ICONINFORMATION
-                );
-	    }
-	}
-        return 0;
+
+                if (!scanning) {
+                    KillTimer(wind, ID_TIMER_GUI);
+                    KillTimer(wind, ID_TIMER_SCAN_UPDATE);
+
+                    if (scanThread != NULL) {
+                        CloseHandle(scanThread);
+                        scanThread = NULL;
+                    }
+
+                    MessageBoxA(
+                        wind,
+                        "Scanning Complete",
+                        "Hedda Defender",
+                        MB_OK | MB_ICONINFORMATION
+                    );
+
+                    InvalidateRect(wind, NULL, FALSE);
+                }
+            }
+
+            return 0;
+        }
+
+        break;
 
     case WM_SIZE:
         InvalidateRect(wind, NULL, FALSE);
@@ -350,6 +661,7 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(wind, &ps);
+
         RECT rect;
         GetClientRect(wind, &rect);
 
@@ -362,9 +674,18 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
         HDC paintDC = hdc;
 
         if (memDC && width > 0 && height > 0) {
-            backBuffer = CreateCompatibleBitmap(hdc, width, height);
+            backBuffer = CreateCompatibleBitmap(
+                hdc,
+                width,
+                height
+            );
+
             if (backBuffer) {
-                oldBitmap = (HBITMAP)SelectObject(memDC, backBuffer);
+                oldBitmap = (HBITMAP)SelectObject(
+                    memDC,
+                    backBuffer
+                );
+
                 paintDC = memDC;
             }
         }
@@ -387,14 +708,27 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
             );
 
             if (font) {
-                HFONT oldFont = (HFONT)SelectObject(paintDC, font);
+                HFONT oldFont =
+                    (HFONT)SelectObject(paintDC, font);
 
                 SetBkMode(paintDC, TRANSPARENT);
-                SetTextColor(paintDC, RGB(85, 90, 110));
+                SetTextColor(
+                    paintDC,
+                    RGB(85, 90, 110)
+                );
 
-                RECT subtitleRect = { 20, 88, rect.right - 20, 120 };
-                DrawTextA(paintDC, "A simple security scan for your PC", -1,
-                          &subtitleRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                RECT subtitleRect = {
+                    20, 88,
+                    rect.right - 20, 120
+                };
+
+                DrawTextA(
+                    paintDC,
+                    "A simple security scan for your PC",
+                    -1,
+                    &subtitleRect,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE
+                );
 
                 SelectObject(paintDC, oldFont);
                 DeleteObject(font);
@@ -404,12 +738,21 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
         }
 
         if (paintDC == memDC && backBuffer) {
-            BitBlt(hdc, 0, 0, width, height, memDC, 0, 0, SRCCOPY);
+            BitBlt(
+                hdc,
+                0, 0,
+                width, height,
+                memDC,
+                0, 0,
+                SRCCOPY
+            );
+
             SelectObject(memDC, oldBitmap);
         }
 
         if (backBuffer)
             DeleteObject(backBuffer);
+
         if (memDC)
             DeleteDC(memDC);
 
@@ -427,7 +770,7 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
 int main(void)
 {
     if (!init_scanner()) {
-        puts("Failed to init scanner");
+        puts("Failed to initialize scanner.");
         return 1;
     }
 
@@ -440,28 +783,36 @@ int main(void)
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc = windProc;
 
-    if (!RegisterClassA(&wc))
+    if (!RegisterClassA(&wc)) {
+        puts("Failed to register window class.");
         return 1;
+    }
 
     HWND wind = CreateWindowExA(
         0,
         wc.lpszClassName,
         "Hedda Defender",
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        900, 600,
-        NULL, NULL,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        900,
+        600,
+        NULL,
+        NULL,
         wc.hInstance,
         NULL
     );
 
-    if (!wind)
+    if (!wind) {
+        puts("Failed to create window.");
         return 1;
+    }
 
     ShowWindow(wind, SW_SHOW);
     UpdateWindow(wind);
 
     MSG msg;
+
     while (GetMessageA(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageA(&msg);

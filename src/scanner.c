@@ -397,6 +397,7 @@ typedef struct {
 typedef struct {
 	uint64_t n_scanned;
 	uint64_t n_sus;
+	uint64_t n_total;
 	BOOL is_scanning;
 } ScanResult;
 
@@ -404,6 +405,7 @@ HANDLE scan_result_mutex = NULL;
 ScanResult scan_result = {
 	.n_scanned = 0,
 	.n_sus = 0,
+	.n_total = 0,
 	.is_scanning = FALSE,
 };
 
