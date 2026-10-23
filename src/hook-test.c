@@ -131,6 +131,8 @@ BOOL apply_VirtualAllocEx_hook(HANDLE proc, HMODULE proc_mod, HMODULE local_mod)
 	}
 
 	uint8_t local_hook[6+8];
+    /* CMP [RSP + 40], 0x40 */
+    /* JNZ  */
 	memcpy(local_hook, (uint8_t[6]){ 0xFF,0x25,0x00,0x00,0x00,0x00 }, 6); // JMP QWORD PTR [RIP]
 	void *dest = proc_func + 6+8;
 	memcpy(local_hook+6, &dest, 8); // Pointer to the (modified) body of the function
@@ -144,6 +146,46 @@ BOOL apply_VirtualAllocEx_hook(HANDLE proc, HMODULE proc_mod, HMODULE local_mod)
 	
 	if (!WriteProcessMemory(proc, proc_func, local_func, sizeof(local_func), NULL))
 		return print_win_err(GetLastError(), "Failed to inject code into VirtualAllocEx in external process address space") && FALSE;
+	return TRUE;
+}
+
+#define CREATEREMOTETHREAD_TRAMPOLINE_INSTRUCTIONS \
+    0x4C, 0x8B, 0xDC, \
+    0x48, 0x83, 0xEC, 0x48, \
+    0x44, 0x8B, 0x54, 0x24, 0x78, \
+    0x48, 0x8B, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00
+
+// TODO: DRY.
+BOOL apply_CreateRemoteThread_hook(HANDLE proc, HMODULE proc_mod, HMODULE local_mod) {
+	uint8_t *proc_func = get_func_addr_in_proc(proc_mod, local_mod, "CreateRemoteThread");
+	if (!proc_func) return FALSE;
+
+	uint8_t local_func[] = { CREATEREMOTETHREAD_TRAMPOLINE_INSTRUCTIONS };
+	if (!ReadProcessMemory(proc, proc_func, local_func, sizeof(local_func), NULL))
+		return print_win_err(GetLastError(), "Failed to read CreateRemoteThread in external process address space") && FALSE;
+
+	const uint8_t trampoline[] = { CREATEREMOTETHREAD_TRAMPOLINE_INSTRUCTIONS };
+	size_t trampoline_sz = sizeof(trampoline);
+	if (memcmp(local_func, trampoline, trampoline_sz) != 0) {
+		puts("Unexpected data in CreateRemoteThread in external process address space:");
+		print_hex_delta(local_func, trampoline, trampoline_sz);
+		return FALSE;
+	}
+
+	uint8_t local_hook[trampoline_sz+6+8];
+    memcpy(local_hook, trampoline, trampoline_sz);
+	memcpy(local_hook+trampoline_sz, (uint8_t[6]){ 0xFF,0x25,0x00,0x00,0x00,0x00 }, 6); // JMP QWORD PTR [RIP]
+	void *dest = proc_func + trampoline_sz;
+	memcpy(local_hook+trampoline_sz+6, &dest, 8); // Pointer to the rest of the function (after the trampoline instructions)
+	
+	void *proc_hook = copy_to_proc_executable(proc, local_hook, sizeof(local_hook));
+	if (proc_hook == NULL) return FALSE;
+
+	memcpy(local_func, (uint8_t[6]){ 0xFF,0x25,0x00,0x00,0x00,0x00 }, 6); // JMP QWORD PTR [RIP]
+	memcpy(local_func+6, &proc_hook, 8); // Address of hook
+	
+	if (!WriteProcessMemory(proc, proc_func, local_func, sizeof(local_func), NULL))
+		return print_win_err(GetLastError(), "Failed to inject code into CreateRemoteThread in external process address space") && FALSE;
 	return TRUE;
 }
 
