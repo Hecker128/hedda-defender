@@ -10,10 +10,10 @@
 #include <winnt.h>
 #include <wincrypt.h>
 
-////#define USE_YARA // Undefine to use hedda-defender without YARA.
+#define USE_YARA
 
 #ifdef USE_YARA
-# include <yara.h>
+#include <yara.h>
 #endif
 
 /// data:    Pointer to where to put the data pointer.
@@ -365,6 +365,14 @@ BOOL pe_is_sus(const uint8_t *data, uint64_t len, const uint16_t *kernel32_ordin
 }
 
 BOOL file_is_sus(const char *path, const uint16_t *kernel32_ordinals) {
+#ifdef USE_YARA
+    BOOL yara_matched = FALSE;
+    if (!yara_scan_file(path,&yara_matched)) {
+        LOG_PRINTF("Could not complete YARA scan: %s\n",path);
+        return TRUE;
+    }
+#endif
+
 	const uint8_t *data;
 	int64_t len;
 	HANDLE mapping;
@@ -384,14 +392,20 @@ BOOL file_is_sus(const char *path, const uint16_t *kernel32_ordinals) {
 	////for (int i = 0; i < 32; LOG_PRINTF("%.2x", hash[i++]));
 	////LOG_PUTCHAR('\n');
 
-	if (pe_is_sus(data, len, kernel32_ordinals)) {
-		LOG_PUTS("File is suspicious.");
-		unmap_file(data, mapping, file);
-		return TRUE;
-	}
+	//if (pe_is_sus(data, len, kernel32_ordinals)) {
+	//	LOG_PUTS("File is suspicious.");
+	//	unmap_file(data, mapping, file);
+	//	return TRUE;
+	//}
+    
+    BOOL pe_suspicious = pe_is_sus(data, (uint64_t)len, kernel32_ordinals);
 
 	unmap_file(data, mapping, file);
-	return FALSE;
+#ifdef USE_YARA
+    return yara_matched || pe_suspicious;
+#else
+    return pe_suspicious;
+#endif
 }
 
 typedef struct {
@@ -427,13 +441,104 @@ BOOL init_scanner() {
 }
 
 #ifdef USE_YARA
+
+static YR_RULES *yara_rules = NULL;
+
+static int yara_match_callback(
+        YR_SCAN_CONTEXT *context,
+        int message,
+        void *message_data,
+        void *user_data)
+{
+    (void)context;
+   
+    if (message == CALLBACK_MSG_RULE_MATCHING) {
+        YR_RULE *rule = (YR_RULE *)message_data;
+        BOOL *matched = (BOOL *)user_data;
+
+        *matched = TRUE;
+        LOG_PRINTF("YARA match: %s\n", rule->identifier);
+    }
+    return CALLBACK_CONTINUE;
+}   
+
 /// Leaks memory on failure.
-BOOL init_yara() {
-	//...
+BOOL init_yara() 
+{
+    if (yr_initialize() != ERROR_SUCCESS) {
+        LOG_PUTS("Failed to initialize YARA.");
+        return FALSE;
+    }
+    YR_COMPILER *compiler = NULL;
+
+    if (yr_compiler_create(&compiler) != ERROR_SUCCESS) {
+        LOG_PUTS("Failed to create YARA compiler.");
+        yr_finalize();
+        return FALSE;
+    }
+
+    const char *rule_files[] = {
+        "YARA\\RANSOM_MS17-010_Wannacrypt.yar",
+        "YARA\\RANSOM_Petya.yar"
+    };
+    BOOL success = TRUE;
+    
+    for (size_t i = 0; i < sizeof(rule_files) / sizeof(rule_files{0]): i++) {
+        File *file = NULL;
+
+        if (fopen_s(&file, rule_files[i], "r") i= 0 || file == NULL) {
+            LOG_PRINTF("Could not open YARA rule file: %s\n", rule_files[i]);
+            success = FALSE;
+            break;
+        }
+        int errors = yr_compiler_add_file(compiler,file,NULL,rule_files[i]);
+
+        fclose(file);
+        if (errors != 0) {
+            LOG_PRINTF("Failed to compile YARA rules from: %s\n",rule_files[i]);
+            success = FALSE;
+            break;
+        }
+    }
+    if (success && yr_compiler_get_rules(compiler, &yara_rules) != ERROR_SUCCESS) {
+        LOG_PUTS("Failed to compile the final YARA rules.");
+        success = FALSE;
+    }
+    yr_compiler_destroy(compiler);
+    if (!success) {
+        if (yara_rules != NULL) {
+            yr_rules_destroy(yara_rules);
+            yara_rules = NULL;
+        }
+        yr_finalize();
+        return FALSE;
+    }
+    LOG_PUTS("YARA rules loaded successfully.");
+    return TRUE;
 }
 
-void cleanup_yara() {
-	//...
+static BOOL yara_scan_file(const char *path, BOOL *matched)
+{
+    *matched = FALSE;
+    if (yara_rules == NULL)
+        return FALSE;
+
+    int result = yr_rules_scan_file(yara_rules,path,SCAN_FLAGS_FAST_MODE,yara_match_callback,matched,0);
+    if (result != ERROR_SUCCESS) {
+        LOG_PRINTF("YARA scan failed for %s (error %d).\n",path,result);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void cleanup_yara(void)
+{
+    if (yara_rules != NULL) {
+        yr_rules_destroy(yara_rules);
+        yara_rules = NULL;
+    }
+    yr_finalize();
+    LOG_PUTS("YARA resources released.");
 }
 #endif
 
