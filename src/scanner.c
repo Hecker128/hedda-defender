@@ -1,4 +1,4 @@
-#include "util.c"
+#include "util.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -14,6 +14,7 @@
 
 #ifdef USE_YARA
 #include <yara.h>
+static BOOL yara_scan_file(const char *path, BOOL *matched);
 #endif
 
 /// data:    Pointer to where to put the data pointer.
@@ -483,10 +484,10 @@ BOOL init_yara()
     };
     BOOL success = TRUE;
     
-    for (size_t i = 0; i < sizeof(rule_files) / sizeof(rule_files{0]): i++) {
-        File *file = NULL;
+    for (size_t i = 0; i < sizeof(rule_files) / sizeof(rule_files[0]); i++) {
+        FILE *file = NULL;
 
-        if (fopen_s(&file, rule_files[i], "r") i= 0 || file == NULL) {
+        if (fopen_s(&file, rule_files[i], "r") != 0 || file == NULL) {
             LOG_PRINTF("Could not open YARA rule file: %s\n", rule_files[i]);
             success = FALSE;
             break;

@@ -5,7 +5,9 @@
 #include <stdio.h>
 #include <math.h>
 
-#include "scanner.c"
+#include <string.h>
+#include "scanner.h"
+#include "util.h"
 
 #define ID_TIMER_GUI          2
 #define ID_TIMER_SCAN_UPDATE  3

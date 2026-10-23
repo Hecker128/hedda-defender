@@ -1,3 +1,5 @@
+#include "util.h"
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <windows.h>
@@ -7,9 +9,9 @@
 // running.
 BOOL logging_enabled = FALSE;
 
-#define LOG_PUTS(msg) if (logging_enabled) { puts(msg); }
-#define LOG_PRINTF(msg, ...) if (logging_enabled) { printf(msg, __VA_ARGS__); }
-#define LOG_PUTCHAR(msg, ...) if (logging_enabled) { putchar(msg); }
+//#define LOG_PUTS(msg) if (logging_enabled) { puts(msg); }
+//#define LOG_PRINTF(msg, ...) if (logging_enabled) { printf(msg, __VA_ARGS__); }
+//#define LOG_PUTCHAR(msg, ...) if (logging_enabled) { putchar(msg); }
 
 uint32_t print_win_err(uint32_t err, const char *fmt, ...) {
 	if (!logging_enabled) return err;
@@ -19,11 +21,19 @@ uint32_t print_win_err(uint32_t err, const char *fmt, ...) {
 	vprintf(fmt, args);
 	va_end(args);
 
-	const char *msg;
-	uint32_t flags = FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_IGNORE_INSERTS;
-	if (FormatMessage(flags, NULL, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), (char *)&msg, 0, NULL))
-		printf(". Error code: 0x%x, %s", err, msg);	
-	else
-		printf(". Error code: 0x%x.\n", err);
+	LPSTR msg = NULL;
+
+    uint32_t flags = FORMAT_MESSAGE_FROM_SYSTEM |
+                     FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                     FORMAT_MESSAGE_IGNORE_INSERTS;
+
+    if (FormatMessageA(flags, NULL, err,
+            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            (LPSTR)&msg, 0, NULL)) {
+        printf(". Error code: 0x%x, %s", err, msg);
+        LocalFree(msg);
+    } else {
+        printf(". Error code: 0x%x.\n", err);
+    }
 	return err;
 }
