@@ -1,16 +1,25 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
+#include <winerror.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <math.h>
-
 #include <string.h>
-#include "scanner.h"
-#include "util.h"
+#include "scanner.c"
 
-#define ID_TIMER_GUI          2
-#define ID_TIMER_SCAN_UPDATE  3
+#if USE_APPNOTIFICATIONS
+# include "appnotifications.c"
+#endif
+
+#if USE_API_HOOKS
+# include "dynamic.c"
+#endif
+
+#define ID_TIMER_GUI            2
+#define ID_TIMER_SCAN_UPDATE    3
+
+// Logging enabled for main thread.
+static BOOL logging_enabled = FALSE;
 
 static HANDLE scanThread = NULL;
 static BOOL scanning = FALSE;
@@ -22,6 +31,10 @@ static int frame = 0;
 static DWORD scanStartTime = 0;
 static uint64_t scannedFiles = 0;
 static uint64_t totalFiles = 0;
+static uint64_t maliciousFiles = 0;
+static char **maliciousPaths;
+
+static char *rootDir = "C:";
 
 static RECT getButtonRect(const RECT *rect)
 {
@@ -128,9 +141,13 @@ static void drawSpinner(HDC hdc, int cx, int cy, int currentFrame)
 
 static void formatTime(DWORD seconds, char *buffer, size_t size)
 {
-    unsigned long minutes = (unsigned long)(seconds / 60);
+    unsigned long hours = (unsigned long)(seconds / 3600);
+    unsigned long minutes = (unsigned long)((seconds % 3600) / 60);
     unsigned long remaining = (unsigned long)(seconds % 60);
-    _snprintf_s(buffer, size, _TRUNCATE, "%lu:%02lu", minutes, remaining);
+    if (hours > 0)
+        _snprintf_s(buffer, size, _TRUNCATE, "%lu:%02lu:%02lu", hours, minutes, remaining);
+    else
+        _snprintf_s(buffer, size, _TRUNCATE, "%lu:%02lu", minutes, remaining);
 }
 
 static void drawScanStatus(HDC hdc, const RECT *rect)
@@ -384,11 +401,12 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
 
                 scannedFiles = 0;
                 totalFiles = 0;
+                maliciousFiles = 0;
                 countingFiles = TRUE;
                 scanStartTime = GetTickCount();
                 frame = 0;
 
-                scanThread = create_scan_thread("C:");
+                scanThread = create_scan_thread(rootDir, logging_enabled);
                 if (scanThread == NULL) {
                     scanning = FALSE;
                     countingFiles = FALSE;
@@ -419,11 +437,27 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
             if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_ABANDONED) {
                 scanning = scan_result.is_scanning;
                 countingFiles = scan_result.is_counting_files;
-                scannedFiles = scan_result.n_scanned;
                 totalFiles = scan_result.n_total;
-                ReleaseMutex(scan_result_mutex);
+                scannedFiles = scan_result.n_scanned;
 
-                InvalidateRect(wind, NULL, FALSE);
+                uint64_t maliciousFilesPrev = maliciousFiles;
+                maliciousFiles = scan_result.n_malicious;
+                if (maliciousFiles != maliciousFilesPrev) {
+                    maliciousPaths = realloc(maliciousPaths, maliciousFiles * sizeof(char *));
+
+                    for (uint64_t i = maliciousFilesPrev; i < maliciousFiles; i++) {
+                        const char *path = scan_result.malicious_infos[i].path;
+                        size_t pathSize = strlen(path) + 1;
+                        maliciousPaths[i] = malloc(pathSize);
+                        memcpy(maliciousPaths[i], path, pathSize);
+#ifdef USE_APPNOTIFICATIONS
+                        send_threat_found_notification(maliciousPaths[i]);
+#endif
+                    }
+                    InvalidateRect(wind, NULL, FALSE);
+                }
+
+                ReleaseMutex(scan_result_mutex);
 
                 if (!scanning) {
                     KillTimer(wind, ID_TIMER_GUI);
@@ -470,6 +504,14 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
         drawGradient(paintDC, &rect);
         drawTitle(paintDC, &rect);
 
+        RECT maliciousRect = { rect.right - 16 - 128, rect.bottom - 16 - 64, rect.right - 16, rect.bottom - 16 };
+        for (uint64_t i = 0; i < maliciousFiles; i++) {
+            DrawTextA(paintDC, "Threat found:", -1, &maliciousRect, DT_TOP | DT_CENTER);
+            DrawTextA(paintDC, maliciousPaths[i], -1, &maliciousRect, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            maliciousRect.top -= 64 + 16;
+            maliciousRect.bottom -= 64 + 16;
+        }
+
         if (scanning) {
             drawScanStatus(paintDC, &rect);
         } else {
@@ -515,14 +557,48 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcA(wind, msg, wp, lp);
 }
 
+static BOOL parse_args(int argc, char **argv)
+{
+    const char *usage =
+        "USAGE: hedda-defender.exe [options]\n"
+        "\n"
+        "OPTIONS:\n"
+        "  -v\t\t- verbose (i.e. enable logging to stdout)\n"
+        "  -r path...\t- root directory for scanning (default is 'C:')";
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0) {
+            LOG_PUTS(usage);
+            return FALSE;
+        } else if (strcmp(argv[i], "-v") == 0) {
+            logging_enabled = TRUE;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            if (++i >= argc) {
+                LOG_PUTS(usage);
+                return FALSE;
+            }
+            rootDir = argv[i];
+        }
+    }
+    return TRUE;
+}
+
 int main(int argc, char **argv)
 {
-    if (argc >= 2 && strcmp(argv[1], "-v") == 0) logging_enabled = TRUE;
+    if (!parse_args(argc, argv))
+        return 1;
 
     if (!init_scanner()) {
-        puts("Failed to initialize scanner.");
+        LOG_PUTS("Failed to initialize scanner.");
         return 1;
     }
+
+#ifdef USE_APPNOTIFICATIONS
+    HRESULT result = init_appnotifications(logging_enabled);
+    if (!SUCCEEDED(result)) return result;
+#endif
+
+    maliciousPaths = malloc(1);
 
     WNDCLASSA wc = {0};
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
@@ -533,7 +609,7 @@ int main(int argc, char **argv)
     wc.lpfnWndProc = windProc;
 
     if (!RegisterClassA(&wc)) {
-        puts("Failed to register window class.");
+        LOG_PUTS("Failed to register window class.");
         CloseHandle(scan_result_mutex);
         return 1;
     }
@@ -545,10 +621,14 @@ int main(int argc, char **argv)
     );
 
     if (!wind) {
-        puts("Failed to create window.");
+        LOG_PUTS("Failed to create window.");
         CloseHandle(scan_result_mutex);
         return 1;
     }
+
+#ifdef USE_API_HOOKS
+    HANDLE hookerThread = create_dynamic_hook_injector_thread(logging_enabled);
+#endif
 
     ShowWindow(wind, SW_SHOW);
     UpdateWindow(wind);
@@ -564,5 +644,18 @@ int main(int argc, char **argv)
         scan_result_mutex = NULL;
     }
 
+    for (uint64_t i = 0; i < maliciousFiles; i++)
+        free(maliciousPaths[i]);
+    free(maliciousPaths);
+
+#ifdef USE_API_HOOKS
+    free(hookerThread);
+#endif
+#ifdef USE_APPNOTIFICATIONS
+    uninit_appnotifications();
+#endif
+
     return (int)msg.wParam;
 }
+
+// vim: tabstop=4 shiftwidth=4 expandtab

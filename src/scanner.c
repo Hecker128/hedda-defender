@@ -1,8 +1,6 @@
-#include "util.h"
+#include "util.c"
 
-#include <math.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 
 #include <windows.h>
@@ -10,19 +8,88 @@
 #include <winnt.h>
 #include <wincrypt.h>
 
-#define USE_YARA
+// Logging enabled for scan thread. Set by create_scan_thread before thread
+// creation.
+static BOOL logging_enabled;
 
-#ifdef USE_YARA
-#include <yara.h>
-static BOOL yara_scan_file(const char *path, BOOL *matched);
-#endif
+#ifdef USE_YARA // Optionally defined in build.bat
+# include <yara.h>
+
+static YR_RULES *yara_rules;
+
+static int yara_match_callback(YR_SCAN_CONTEXT *context, int message, void *message_data, void *user_data) {
+    if (message == CALLBACK_MSG_RULE_MATCHING) {
+        YR_RULE *rule = (YR_RULE *)message_data;
+        BOOL *matched = (BOOL *)user_data;
+
+        *matched = TRUE;
+        LOG_PRINTF("YARA match: %s\n", rule->identifier);
+    }
+    return CALLBACK_CONTINUE;
+}   
+
+/// Leaks memory on failure.
+static BOOL init_yara() {
+	if (yr_initialize() != ERROR_SUCCESS) {
+		LOG_PUTS("Failed to initialize YARA.");
+		return FALSE;
+	}
+	YR_COMPILER *compiler;
+	if (yr_compiler_create(&compiler) != ERROR_SUCCESS) {
+		LOG_PUTS("Failed to create YARA compiler.");
+		return FALSE;
+	}
+	const char *rule_paths[] = {
+		"src\\YARA\\RANSOM_MS17-010_Wannacrypt.yar",
+		"src\\YARA\\RANSOM_Petya.yar"
+	};
+	for (size_t i = 0; i < sizeof(rule_paths) / sizeof(*rule_paths); i++) {
+		FILE *file = fopen(rule_paths[i], "r");
+		if (file == NULL) {
+			LOG_PRINTF("Could not open YARA rule file: %s\n", rule_paths[i]);
+			return FALSE;
+		}
+
+		int errors = yr_compiler_add_file(compiler, file, NULL, rule_paths[i]);
+		fclose(file);
+
+		if (errors != 0) {
+			LOG_PRINTF("Failed to compile YARA rules from: %s\n", rule_paths[i]);
+			return FALSE;
+		}
+	}
+	if (yr_compiler_get_rules(compiler, &yara_rules) != ERROR_SUCCESS) {
+		LOG_PUTS("Failed to compile the final YARA rules.");
+		return FALSE;
+	}
+	yr_compiler_destroy(compiler);
+
+	LOG_PUTS("YARA rules loaded successfully.");
+	return TRUE;
+}
+
+static BOOL yara_scan_file(const char *path, BOOL *matched) {
+	int result = yr_rules_scan_file(yara_rules, path, SCAN_FLAGS_FAST_MODE, yara_match_callback, matched, 0);
+	if (result != ERROR_SUCCESS) {
+		LOG_PRINTF("YARA scan failed for %s (error %d).\n", path, result);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/// `init_yara` must have been called before this is called.
+static void cleanup_yara() {
+	yr_rules_destroy(yara_rules);
+	yr_finalize();
+}
+#endif // USE_YARA
 
 /// data:    Pointer to where to put the data pointer.
 /// len:     Pointer to where to put the data length.
 /// mapping: Pointer to where to put the mapping handle.
 /// file:    Pointer to where to put the file handle.
 /// path:    File path.
-BOOL map_file(const uint8_t **data, int64_t *len, HANDLE *mapping, HANDLE *file, const char *path) {
+static BOOL map_file(const uint8_t **data, int64_t *len, HANDLE *mapping, HANDLE *file, const char *path) {
 	*file = CreateFile(path, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
 	if (*file == INVALID_HANDLE_VALUE) return FALSE;
 
@@ -37,7 +104,7 @@ BOOL map_file(const uint8_t **data, int64_t *len, HANDLE *mapping, HANDLE *file,
 }
 
 /// Cleanup for stuff from map_file.
-void unmap_file(const uint8_t *data, HANDLE mapping, HANDLE file) {
+static void unmap_file(const uint8_t *data, HANDLE mapping, HANDLE file) {
 	UnmapViewOfFile(data);
 	CloseHandle(mapping);
 	CloseHandle(file);
@@ -48,7 +115,7 @@ void unmap_file(const uint8_t *data, HANDLE mapping, HANDLE file) {
 /// len:  Length of data.
 /// Returns TRUE if successful.
 /// NOTE: Leaks memory on failure.
-BOOL sha256_hash(uint8_t *hash, const uint8_t *data, DWORD len) {
+static BOOL sha256_hash(uint8_t *hash, const uint8_t *data, DWORD len) {
 	HCRYPTPROV hp;
 	HCRYPTHASH hh;
 	if (!CryptAcquireContext(&hp, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) return FALSE;
@@ -64,17 +131,22 @@ BOOL sha256_hash(uint8_t *hash, const uint8_t *data, DWORD len) {
 	return TRUE;
 }
 
-/// Compares (32-byte) SHA-256 hashes a and b.
-/// Returns TRUE if equal.
-BOOL sha256_compare(const uint8_t *a, const uint8_t *b) {
-	const uint64_t *a64 = (uint64_t *)a;
-	const uint64_t *b64 = (uint64_t *)b;
-	return a64[0]==b64[0] && a64[1]==b64[1] && a64[2]==b64[2] && a64[3]==b64[3];
+static BOOL sha256_hash_file(uint8_t *hash, const char *path) {
+	const uint8_t *data;
+	int64_t len;
+	HANDLE mapping;
+	HANDLE file;
+	if (!map_file(&data, &len, &mapping, &file, path)) return FALSE;
+
+	BOOL success = sha256_hash(hash, data, len);
+	unmap_file(data, mapping, file);
+
+	return success;
 }
 
 /// Looks for byte sequence `seq` with length `seq_len` in `data` with length `len`.
 /// Returns TRUE if found.
-BOOL data_has_seq(const uint8_t *data, size_t len, const uint8_t *seq, size_t seq_len) {
+static BOOL data_has_seq(const uint8_t *data, size_t len, const uint8_t *seq, size_t seq_len) {
 	if (seq_len > len) return FALSE;
 	const uint8_t *end = data + len - seq_len;
 	do {
@@ -85,7 +157,7 @@ BOOL data_has_seq(const uint8_t *data, size_t len, const uint8_t *seq, size_t se
 	return FALSE;
 }
 
-double data_get_entropy(const uint8_t *data, size_t len) {
+static double data_get_entropy(const uint8_t *data, size_t len) {
 	size_t cnt[256];
 	memset(cnt, 0, 256 * sizeof(size_t));
 	for (size_t i = 0; i < len; cnt[data[i++]] += 1);
@@ -104,7 +176,7 @@ double data_get_entropy(const uint8_t *data, size_t len) {
 /// n_sections:    Number of sections in section_heads.
 /// Returns the file offset of rva if it's within one of the sections' bounds.
 /// Returns 0 on failure.
-uint64_t rva_get_file_offset(uint32_t rva, const PIMAGE_SECTION_HEADER section_heads, uint16_t n_sections) {
+static uint64_t rva_get_file_offset(uint32_t rva, const PIMAGE_SECTION_HEADER section_heads, uint16_t n_sections) {
 	for (uint16_t i = 0; i < n_sections; i++) {
 		const uint32_t start = section_heads[i].VirtualAddress;
 		const uint32_t end = start + section_heads[i].SizeOfRawData;
@@ -114,12 +186,12 @@ uint64_t rva_get_file_offset(uint32_t rva, const PIMAGE_SECTION_HEADER section_h
 	return 0;
 }
 
-// Returns TRUE if the file specified by `path` has a valid certificate and
-// Microsoft is the root signer. (It's supposed to anyway, I'm not good with
-// certificates and stuff.)
-// TODO: Confirm that this fails when a file with an invalid signature (e.g.
-// with a hash mismatch) is passed.
-BOOL valid_microsoft_root_cert(const char *path) {
+/// Returns TRUE if the file specified by `path` has a valid certificate and
+/// Microsoft is the root signer. (It's supposed to anyway, I'm not good with
+/// certificates and stuff.)
+/// TODO: Confirm that this fails when a file with an invalid signature (e.g.
+/// with a hash mismatch) is passed.
+static BOOL valid_microsoft_root_cert(const char *path) {
 	PCCERT_CONTEXT cert;
 	if (MsiGetFileSignatureInformation(path, 0, &cert, NULL, NULL) != S_OK) return FALSE;
 
@@ -168,8 +240,8 @@ static const char *kernel32_sus_names[] = {
 	"VirtualAllocEx",
 };
 
-// Helper function for get_kernel32_ordinals.
-BOOL get_kernel32_ordinals_inner(uint16_t *ordinals, const uint8_t *data) {
+/// Helper function for get_kernel32_ordinals.
+static BOOL get_kernel32_ordinals_inner(uint16_t *ordinals, const uint8_t *data) {
 	const PIMAGE_DOS_HEADER dos_header = (PIMAGE_DOS_HEADER)data;
 
 	// NOTE: At this point we don't know if it's 32-bit or 64-bit yet.
@@ -213,7 +285,7 @@ BOOL get_kernel32_ordinals_inner(uint16_t *ordinals, const uint8_t *data) {
 /// be able to check executables for suspicious imports).
 /// ordinals: Pointer (of length KERNEL32_SUSSYBAKAS_MAX) to where to put the ordinal numbers.
 /// Returns TRUE if successful.
-BOOL get_kernel32_ordinals(uint16_t *ordinals) {
+static BOOL get_kernel32_ordinals(uint16_t *ordinals) {
 	const char path[] = "C:\\Windows\\System32\\KERNEL32.DLL";	
 	if (!valid_microsoft_root_cert(path)) return FALSE;
 
@@ -231,7 +303,7 @@ BOOL get_kernel32_ordinals(uint16_t *ordinals) {
 
 /// Helper function for pe_is_sus.
 /// TODO: Also check imports from imported DLLs.
-BOOL imports_are_sus(
+static BOOL imports_are_sus(
 	const uint8_t *data,
 	uint64_t len,
 	const PIMAGE_NT_HEADERS32 nt_heads32,
@@ -309,7 +381,7 @@ BOOL imports_are_sus(
 /// If the PE file is invalid such that the PE loader should fail to load it
 /// (e.g. if it's not actually a PE file), it isn't seen dangerous (i.e. isn't
 /// flagged as suspicious).
-BOOL pe_is_sus(const uint8_t *data, uint64_t len, const uint16_t *kernel32_ordinals) {
+static BOOL pe_is_sus(const uint8_t *data, uint64_t len, const uint16_t *kernel32_ordinals) {
 	if (len < sizeof(IMAGE_DOS_HEADER)) {
 		LOG_PUTS("Not an MZ file (with PE Extension): Not big enough for IMAGE_DOS_HEADER.");
 		return FALSE;
@@ -365,50 +437,6 @@ BOOL pe_is_sus(const uint8_t *data, uint64_t len, const uint16_t *kernel32_ordin
 	return FALSE;
 }
 
-BOOL file_is_sus(const char *path, const uint16_t *kernel32_ordinals) {
-#ifdef USE_YARA
-    BOOL yara_matched = FALSE;
-    if (!yara_scan_file(path,&yara_matched)) {
-        LOG_PRINTF("Could not complete YARA scan: %s\n",path);
-        return TRUE;
-    }
-#endif
-
-	const uint8_t *data;
-	int64_t len;
-	HANDLE mapping;
-	HANDLE file;
-	if (!map_file(&data, &len, &mapping, &file, path)) {
-		LOG_PUTS("Failed to map file (suspicious)!");
-		return TRUE;
-	}
-
-	////uint8_t hash[32];
-	////if (!sha256_hash(hash, data, len)) {
-	////	LOG_PUTS("Failed to hash file (suspicious)!");
-	////	unmap_file(data, mapping, file);
-	////	return TRUE;
-	////}
-	////LOG_PRINTF("SHA-256 hash: ");
-	////for (int i = 0; i < 32; LOG_PRINTF("%.2x", hash[i++]));
-	////LOG_PUTCHAR('\n');
-
-	//if (pe_is_sus(data, len, kernel32_ordinals)) {
-	//	LOG_PUTS("File is suspicious.");
-	//	unmap_file(data, mapping, file);
-	//	return TRUE;
-	//}
-    
-    BOOL pe_suspicious = pe_is_sus(data, (uint64_t)len, kernel32_ordinals);
-
-	unmap_file(data, mapping, file);
-#ifdef USE_YARA
-    return yara_matched || pe_suspicious;
-#else
-    return pe_suspicious;
-#endif
-}
-
 typedef struct {
 	char *path;
 	HANDLE find;
@@ -416,135 +444,81 @@ typedef struct {
 } FindInfo;
 
 typedef struct {
+	char *path;
+	uint8_t hash[32];
+} FileInfo;
+
+typedef struct {
 	uint64_t n_total;
 	uint64_t n_scanned;
 	uint64_t n_sus;
+	uint64_t n_malicious;
+	FileInfo *malicious_infos;
 	BOOL is_scanning;
 	BOOL is_counting_files;
 } ScanResult;
 
 HANDLE scan_result_mutex = NULL;
-ScanResult scan_result = {
-	.n_total = 0,
-	.n_scanned = 0,
-	.n_sus = 0,
-	.is_scanning = FALSE,
-	.is_counting_files = FALSE,
-};
+ScanResult scan_result = {0};
 
+// To be called exactly once, before creating the scan thread or using
+// scan_result.
 BOOL init_scanner() {
 	scan_result_mutex = CreateMutex(NULL, FALSE, NULL);
 	if (scan_result_mutex == NULL) {
 		print_win_err(GetLastError(), "Failed to create mutex for scan result");
 		return FALSE;
 	}
+	scan_result.malicious_infos = malloc(1);
 	return TRUE;
 }
 
+/// `scan_result_mutex` must be aquired by caller when calling this.
+static void scan_file(const char *path, const uint16_t *kernel32_ordinals) {
+	scan_result.n_scanned += 1;
 #ifdef USE_YARA
+	BOOL yara_matched;
+	if (!yara_scan_file(path, &yara_matched)) {
+		LOG_PRINTF("Could not complete YARA scan: %s\n", path);
+	} else if (yara_matched) {
+		FileInfo info;
 
-static YR_RULES *yara_rules = NULL;
+		size_t path_sz = strlen(path) + 1;
+		info.path = malloc(path_sz);
+		memcpy(info.path, path, path_sz);
 
-static int yara_match_callback(
-        YR_SCAN_CONTEXT *context,
-        int message,
-        void *message_data,
-        void *user_data)
-{
-    (void)context;
-   
-    if (message == CALLBACK_MSG_RULE_MATCHING) {
-        YR_RULE *rule = (YR_RULE *)message_data;
-        BOOL *matched = (BOOL *)user_data;
+		if (!sha256_hash_file(info.hash, path)) {
+			LOG_PUTS("Failed to hash file. Flagging as suspicious.");
+			free(info.path);
+			scan_result.n_sus += 1;
+			return;
+		}
 
-        *matched = TRUE;
-        LOG_PRINTF("YARA match: %s\n", rule->identifier);
-    }
-    return CALLBACK_CONTINUE;
-}   
-
-/// Leaks memory on failure.
-BOOL init_yara() 
-{
-    if (yr_initialize() != ERROR_SUCCESS) {
-        LOG_PUTS("Failed to initialize YARA.");
-        return FALSE;
-    }
-    YR_COMPILER *compiler = NULL;
-
-    if (yr_compiler_create(&compiler) != ERROR_SUCCESS) {
-        LOG_PUTS("Failed to create YARA compiler.");
-        yr_finalize();
-        return FALSE;
-    }
-
-    const char *rule_files[] = {
-        "YARA\\RANSOM_MS17-010_Wannacrypt.yar",
-        "YARA\\RANSOM_Petya.yar"
-    };
-    BOOL success = TRUE;
-    
-    for (size_t i = 0; i < sizeof(rule_files) / sizeof(rule_files[0]); i++) {
-        FILE *file = NULL;
-
-        if (fopen_s(&file, rule_files[i], "r") != 0 || file == NULL) {
-            LOG_PRINTF("Could not open YARA rule file: %s\n", rule_files[i]);
-            success = FALSE;
-            break;
-        }
-        int errors = yr_compiler_add_file(compiler,file,NULL,rule_files[i]);
-
-        fclose(file);
-        if (errors != 0) {
-            LOG_PRINTF("Failed to compile YARA rules from: %s\n",rule_files[i]);
-            success = FALSE;
-            break;
-        }
-    }
-    if (success && yr_compiler_get_rules(compiler, &yara_rules) != ERROR_SUCCESS) {
-        LOG_PUTS("Failed to compile the final YARA rules.");
-        success = FALSE;
-    }
-    yr_compiler_destroy(compiler);
-    if (!success) {
-        if (yara_rules != NULL) {
-            yr_rules_destroy(yara_rules);
-            yara_rules = NULL;
-        }
-        yr_finalize();
-        return FALSE;
-    }
-    LOG_PUTS("YARA rules loaded successfully.");
-    return TRUE;
-}
-
-static BOOL yara_scan_file(const char *path, BOOL *matched)
-{
-    *matched = FALSE;
-    if (yara_rules == NULL)
-        return FALSE;
-
-    int result = yr_rules_scan_file(yara_rules,path,SCAN_FLAGS_FAST_MODE,yara_match_callback,matched,0);
-    if (result != ERROR_SUCCESS) {
-        LOG_PRINTF("YARA scan failed for %s (error %d).\n",path,result);
-        return FALSE;
-    }
-    return TRUE;
-}
-
-void cleanup_yara(void)
-{
-    if (yara_rules != NULL) {
-        yr_rules_destroy(yara_rules);
-        yara_rules = NULL;
-    }
-    yr_finalize();
-    LOG_PUTS("YARA resources released.");
-}
+		LOG_PRINTF("%s is a malicious file\n", path);
+		scan_result.n_malicious += 1;
+		scan_result.malicious_infos = realloc(scan_result.malicious_infos, sizeof(FileInfo) * scan_result.n_malicious);
+		scan_result.malicious_infos[scan_result.n_malicious - 1] = info;
+		return;
+	}
 #endif
+	const uint8_t *data;
+	int64_t len;
+	HANDLE mapping;
+	HANDLE file;
+	if (!map_file(&data, &len, &mapping, &file, path)) {
+		LOG_PUTS("Failed to map file. Flagging as suspicious.");
+		scan_result.n_sus += 1;
+		return;
+	}
+	if (pe_is_sus(data, len, kernel32_ordinals))
+		scan_result.n_sus += 1;
+	unmap_file(data, mapping, file);
+
+	return;
+}
 
 /// Do not call this directly. Use create_scan_thread instead.
-DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
+static DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
 	const char *path = lpParam;
 
 	uint16_t kernel32_ordinals[KERNEL32_SUSSYBAKAS_MAX];
@@ -644,8 +618,7 @@ DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
 					if (scan_result.is_counting_files)
 						scan_result.n_total += 1;
 					else {
-						if (file_is_sus(find->path, kernel32_ordinals)) scan_result.n_sus += 1;
-						scan_result.n_scanned += 1;
+						scan_file(find->path, kernel32_ordinals);
 					}
 					if (!ReleaseMutex(scan_result_mutex)) return 1;
 				}
@@ -683,9 +656,10 @@ DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
 	return 0;
 }
 
-// Returns the handle to the created thread, which should be passed to CloseHandle after scan_result.is_scanning goes from TRUE to FALSE.
-HANDLE create_scan_thread(char *path) {
-	if (scan_result_mutex == NULL) return NULL;
+/// Returns the handle to the created thread, which should be passed to
+/// CloseHandle after scan_result.is_scanning goes from TRUE to FALSE.
+HANDLE create_scan_thread(char *path, BOOL logging_enabled_) {
+	logging_enabled = logging_enabled_;
 
 	if (WaitForSingleObject(scan_result_mutex, INFINITE) == WAIT_OBJECT_0) {
 		scan_result.n_total = 0;
