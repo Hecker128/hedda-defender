@@ -7,12 +7,21 @@
 #include <string.h>
 #include "scanner.c"
 
-#if USE_APPNOTIFICATIONS
+#ifdef USE_APPNOTIFICATIONS
 # include "appnotifications.c"
 #endif
 
-#if USE_API_HOOKS
+#ifdef USE_API_HOOKS
 # include "dynamic.c"
+#endif
+
+#ifdef USE_HEDDAFLT
+# include "heddaflt-user.c"
+#endif
+
+#ifdef USE_YARA
+# include "yara-integration.h"
+static YR_RULES *yaraRules;
 #endif
 
 #define ID_TIMER_GUI            2
@@ -406,7 +415,7 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
                 scanStartTime = GetTickCount();
                 frame = 0;
 
-                scanThread = create_scan_thread(rootDir, logging_enabled);
+                scanThread = create_scan_thread(rootDir);
                 if (scanThread == NULL) {
                     scanning = FALSE;
                     countingFiles = FALSE;
@@ -588,7 +597,18 @@ int main(int argc, char **argv)
     if (!parse_args(argc, argv))
         return 1;
 
-    if (!init_scanner()) {
+#ifdef USE_YARA
+    yaraRules = init_yara(logging_enabled);
+    if (yaraRules == NULL)
+        return 1;
+#endif
+
+    if (!init_scanner(
+                logging_enabled
+#ifdef USE_YARA
+                , yaraRules
+#endif
+    )) {
         LOG_PUTS("Failed to initialize scanner.");
         return 1;
     }
@@ -597,8 +617,23 @@ int main(int argc, char **argv)
     HRESULT result = init_appnotifications(logging_enabled);
     if (!SUCCEEDED(result)) return result;
 #endif
+#ifdef USE_API_HOOKS
+    HANDLE hookerThread = create_dynamic_hook_injector_thread(logging_enabled);
+    if (hookerThread == NULL)
+        LOG_PUTS("API hook injection will not be done because thread creation failed.");
+#endif
+#ifdef USE_HEDDAFLT
+    HANDLE heddafltMsgThread = create_heddaflt_message_handler_thread(
+            logging_enabled
+#ifdef USE_YARA
+            , yaraRules
+#endif
+    );
+    if (heddafltMsgThread == NULL)
+        LOG_PUTS("HeddaFlt will not be used because thread creation failed.");
+#endif
 
-    maliciousPaths = malloc(1);
+    maliciousPaths = malloc(sizeof(*maliciousPaths));
 
     WNDCLASSA wc = {0};
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
@@ -626,10 +661,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-#ifdef USE_API_HOOKS
-    HANDLE hookerThread = create_dynamic_hook_injector_thread(logging_enabled);
-#endif
-
     ShowWindow(wind, SW_SHOW);
     UpdateWindow(wind);
 
@@ -648,8 +679,13 @@ int main(int argc, char **argv)
         free(maliciousPaths[i]);
     free(maliciousPaths);
 
+#ifdef USE_HEDDAFLT
+    if (heddafltMsgThread != NULL)
+        CloseHandle(heddafltMsgThread);
+#endif
 #ifdef USE_API_HOOKS
-    free(hookerThread);
+    if (hookerThread != NULL)
+        CloseHandle(hookerThread);
 #endif
 #ifdef USE_APPNOTIFICATIONS
     uninit_appnotifications();

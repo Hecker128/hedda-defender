@@ -3,7 +3,7 @@
     <Platform Name="ARM64" />
     <Platform Name="x64" />
   </Configurations>
-  <Project Path="heddafilter.vcxproj">
+  <Project Path="HeddaFlt.vcxproj">
     <Deploy />
   </Project>
 </Solution>

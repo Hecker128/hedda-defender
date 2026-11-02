@@ -1,12 +1,12 @@
-#include "util.c"
+#include "util.h"
 
 #include <stdint.h>
 
 #include <windows.h>
 #include <psapi.h>
 
-// Logging enabled for dynamic hook injector thread, set by
-// create_dynamic_hook_injector_thread before thread creation.
+// Logging enabled for dynamic hook injector thread.
+// Set by create_dynamic_hook_injector_thread before thread creation.
 static BOOL logging_enabled;
 
 static void *get_func_addr_in_proc(HMODULE proc_mod, HMODULE local_mod, const char *func_name) {
@@ -203,8 +203,7 @@ static BOOL inject_hooks_dynamic() {
 	return TRUE;
 }
 
-/// TODO: Have the driver decide when to inject stuff instead (unless it's disabled through a compiler macro).
-static DWORD __stdcall dynamic_hook_injector_routine(LPVOID lpParam) {
+static DWORD WINAPI dynamic_hook_injector_routine(LPVOID lpParam) {
 	for (;;) {
 		inject_hooks_dynamic();
 		Sleep(1000);

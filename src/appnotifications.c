@@ -1,5 +1,4 @@
-#include "util.c"
-
+#include "util.h"
 #include <windows.h>
 #include <roapi.h>
 #include <winerror.h>

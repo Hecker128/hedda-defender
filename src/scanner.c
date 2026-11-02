@@ -1,109 +1,62 @@
-#include "util.c"
-
+#include "util.h"
 #include <stdint.h>
 #include <stdlib.h>
-
 #include <windows.h>
 #include <msi.h>
 #include <winnt.h>
 #include <wincrypt.h>
 
-// Logging enabled for scan thread. Set by create_scan_thread before thread
-// creation.
+#ifdef USE_YARA
+# include "yara-integration.h"
+
+// YARA rules for scan thread.
+// Set by `init_scanner`.
+static YR_RULES *yara_rules;
+#endif
+
+// Logging enabled for scan thread.
+// Set by `init_scanner`.
 static BOOL logging_enabled;
 
-#ifdef USE_YARA // Optionally defined in build.bat
-# include <yara.h>
-
-static YR_RULES *yara_rules;
-
-static int yara_match_callback(YR_SCAN_CONTEXT *context, int message, void *message_data, void *user_data) {
-    if (message == CALLBACK_MSG_RULE_MATCHING) {
-        YR_RULE *rule = (YR_RULE *)message_data;
-        BOOL *matched = (BOOL *)user_data;
-
-        *matched = TRUE;
-        LOG_PRINTF("YARA match: %s\n", rule->identifier);
-    }
-    return CALLBACK_CONTINUE;
-}   
-
-/// Leaks memory on failure.
-static BOOL init_yara() {
-	if (yr_initialize() != ERROR_SUCCESS) {
-		LOG_PUTS("Failed to initialize YARA.");
-		return FALSE;
-	}
-	YR_COMPILER *compiler;
-	if (yr_compiler_create(&compiler) != ERROR_SUCCESS) {
-		LOG_PUTS("Failed to create YARA compiler.");
-		return FALSE;
-	}
-	const char *rule_paths[] = {
-		"src\\YARA\\RANSOM_MS17-010_Wannacrypt.yar",
-		"src\\YARA\\RANSOM_Petya.yar"
-	};
-	for (size_t i = 0; i < sizeof(rule_paths) / sizeof(*rule_paths); i++) {
-		FILE *file = fopen(rule_paths[i], "r");
-		if (file == NULL) {
-			LOG_PRINTF("Could not open YARA rule file: %s\n", rule_paths[i]);
-			return FALSE;
-		}
-
-		int errors = yr_compiler_add_file(compiler, file, NULL, rule_paths[i]);
-		fclose(file);
-
-		if (errors != 0) {
-			LOG_PRINTF("Failed to compile YARA rules from: %s\n", rule_paths[i]);
-			return FALSE;
-		}
-	}
-	if (yr_compiler_get_rules(compiler, &yara_rules) != ERROR_SUCCESS) {
-		LOG_PUTS("Failed to compile the final YARA rules.");
-		return FALSE;
-	}
-	yr_compiler_destroy(compiler);
-
-	LOG_PUTS("YARA rules loaded successfully.");
-	return TRUE;
-}
-
-static BOOL yara_scan_file(const char *path, BOOL *matched) {
-	int result = yr_rules_scan_file(yara_rules, path, SCAN_FLAGS_FAST_MODE, yara_match_callback, matched, 0);
-	if (result != ERROR_SUCCESS) {
-		LOG_PRINTF("YARA scan failed for %s (error %d).\n", path, result);
-		return FALSE;
-	}
-	return TRUE;
-}
-
-/// `init_yara` must have been called before this is called.
-static void cleanup_yara() {
-	yr_rules_destroy(yara_rules);
-	yr_finalize();
-}
-#endif // USE_YARA
-
-/// data:    Pointer to where to put the data pointer.
-/// len:     Pointer to where to put the data length.
-/// mapping: Pointer to where to put the mapping handle.
-/// file:    Pointer to where to put the file handle.
-/// path:    File path.
+/// Creates a read-only mapping for the file specified by `path` to `*data`.
+/// `*file` receives the file handle created from opening `path`.
+/// `*mapping` receives the file mapping object created for this mapping.
+/// `*len` receives the length of the mapping, which is the size of the file.
+/// Returns `FALSE` on failure.
+/// If this function fails, cleanup is done automatically.
 static BOOL map_file(const uint8_t **data, int64_t *len, HANDLE *mapping, HANDLE *file, const char *path) {
 	*file = CreateFile(path, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
-	if (*file == INVALID_HANDLE_VALUE) return FALSE;
+	if (*file == INVALID_HANDLE_VALUE) {
+		LOG_PRINT_WIN_ERR(GetLastError(), "Failed to open file \"%s\" for mapping", path);
+		return FALSE;
+	}
 
 	*mapping = CreateFileMapping(*file, NULL, PAGE_READONLY, 0, 0, NULL);
-	if (*mapping == NULL) return FALSE;
+	if (*mapping == NULL) {
+		LOG_PRINT_WIN_ERR(GetLastError(), "Failed to create file mapping for \"%s\"", path);
+		CloseHandle(file);
+		return FALSE;
+	}
 
 	*data = MapViewOfFile(*mapping, FILE_MAP_READ, 0, 0, 0);
-	if (*data == NULL) return FALSE;
+	if (*data == NULL) {
+		LOG_PRINT_WIN_ERR(GetLastError(), "Failed to get view of file mapping for \"%s\"", path);
+		CloseHandle(mapping);
+		CloseHandle(file);
+		return FALSE;
+	}
 
-	if (!GetFileSizeEx(*file, (PLARGE_INTEGER)len)) return FALSE;
+	if (!GetFileSizeEx(*file, (PLARGE_INTEGER)len)) {
+		LOG_PRINT_WIN_ERR(GetLastError(), "Failed to get size of file \"%s\" for file mapping", path);
+		UnmapViewOfFile(data);
+		CloseHandle(mapping);
+		CloseHandle(file);
+		return FALSE;
+	}
 	return TRUE;
 }
 
-/// Cleanup for stuff from map_file.
+/// Cleanup for resources received from map_file.
 static void unmap_file(const uint8_t *data, HANDLE mapping, HANDLE file) {
 	UnmapViewOfFile(data);
 	CloseHandle(mapping);
@@ -145,7 +98,7 @@ static BOOL sha256_hash_file(uint8_t *hash, const char *path) {
 }
 
 /// Looks for byte sequence `seq` with length `seq_len` in `data` with length `len`.
-/// Returns TRUE if found.
+/// Returns `TRUE` if found.
 static BOOL data_has_seq(const uint8_t *data, size_t len, const uint8_t *seq, size_t seq_len) {
 	if (seq_len > len) return FALSE;
 	const uint8_t *end = data + len - seq_len;
@@ -283,8 +236,8 @@ static BOOL get_kernel32_ordinals_inner(uint16_t *ordinals, const uint8_t *data)
 
 /// Get numbers that programs use for by-ordinal imports from KERNEL32.DLL (to
 /// be able to check executables for suspicious imports).
-/// ordinals: Pointer (of length KERNEL32_SUSSYBAKAS_MAX) to where to put the ordinal numbers.
-/// Returns TRUE if successful.
+/// ordinals: Pointer (of length `KERNEL32_SUSSYBAKAS_MAX`) to where to put the ordinal numbers.
+/// Returns `TRUE` if successful.
 static BOOL get_kernel32_ordinals(uint16_t *ordinals) {
 	const char path[] = "C:\\Windows\\System32\\KERNEL32.DLL";	
 	if (!valid_microsoft_root_cert(path)) return FALSE;
@@ -301,7 +254,7 @@ static BOOL get_kernel32_ordinals(uint16_t *ordinals) {
 	return ret;
 }
 
-/// Helper function for pe_is_sus.
+/// Helper function for `pe_is_sus`.
 /// TODO: Also check imports from imported DLLs.
 static BOOL imports_are_sus(
 	const uint8_t *data,
@@ -461,26 +414,35 @@ typedef struct {
 HANDLE scan_result_mutex = NULL;
 ScanResult scan_result = {0};
 
-// To be called exactly once, before creating the scan thread or using
-// scan_result.
-BOOL init_scanner() {
+/// To be called by the main thread once, before creating the scan thread or
+/// using `scan_result`.
+BOOL init_scanner(
+	BOOL logging_enabled_
+#ifdef USE_YARA
+	, YR_RULES *yara_rules_
+#endif
+) {
+	logging_enabled = logging_enabled_;
+#ifdef USE_YARA
+	yara_rules = yara_rules_;
+#endif
 	scan_result_mutex = CreateMutex(NULL, FALSE, NULL);
 	if (scan_result_mutex == NULL) {
 		print_win_err(GetLastError(), "Failed to create mutex for scan result");
 		return FALSE;
 	}
-	scan_result.malicious_infos = malloc(1);
+	scan_result.malicious_infos = malloc(sizeof(FileInfo));
 	return TRUE;
 }
 
+/// Helper for `scan_thread_routine`.
 /// `scan_result_mutex` must be aquired by caller when calling this.
 static void scan_file(const char *path, const uint16_t *kernel32_ordinals) {
 	scan_result.n_scanned += 1;
 #ifdef USE_YARA
 	BOOL yara_matched;
-	if (!yara_scan_file(path, &yara_matched)) {
-		LOG_PRINTF("Could not complete YARA scan: %s\n", path);
-	} else if (yara_matched) {
+	if (yara_scan_file(yara_rules, path, &yara_matched, logging_enabled) && yara_matched) {
+		LOG_PRINTF("\"%s\" is a malicious file (YARA matched).\n", path);
 		FileInfo info;
 
 		size_t path_sz = strlen(path) + 1;
@@ -488,13 +450,17 @@ static void scan_file(const char *path, const uint16_t *kernel32_ordinals) {
 		memcpy(info.path, path, path_sz);
 
 		if (!sha256_hash_file(info.hash, path)) {
-			LOG_PUTS("Failed to hash file. Flagging as suspicious.");
+			// This error handling behaviour is kinda dumb but I
+			// don't see any reason why it would suddenly fail to
+			// hash anyway.
+			// In the worst case scenario though, at least flagging
+			// it as suspicious is better than nothing.
+			LOG_PUTS("Failed to hash malicious file. Flagging as suspicious.");
 			free(info.path);
 			scan_result.n_sus += 1;
 			return;
 		}
 
-		LOG_PRINTF("%s is a malicious file\n", path);
 		scan_result.n_malicious += 1;
 		scan_result.malicious_infos = realloc(scan_result.malicious_infos, sizeof(FileInfo) * scan_result.n_malicious);
 		scan_result.malicious_infos[scan_result.n_malicious - 1] = info;
@@ -506,7 +472,6 @@ static void scan_file(const char *path, const uint16_t *kernel32_ordinals) {
 	HANDLE mapping;
 	HANDLE file;
 	if (!map_file(&data, &len, &mapping, &file, path)) {
-		LOG_PUTS("Failed to map file. Flagging as suspicious.");
 		scan_result.n_sus += 1;
 		return;
 	}
@@ -517,16 +482,12 @@ static void scan_file(const char *path, const uint16_t *kernel32_ordinals) {
 	return;
 }
 
-/// Do not call this directly. Use create_scan_thread instead.
-static DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
+/// Do not call this directly. Use `create_scan_thread` instead.
+static DWORD WINAPI scan_thread_routine(LPVOID lpParam) {
 	const char *path = lpParam;
 
 	uint16_t kernel32_ordinals[KERNEL32_SUSSYBAKAS_MAX];
 	if (!get_kernel32_ordinals(kernel32_ordinals)) return 1;
-
-#ifdef USE_YARA
-	if (!init_yara()) return 1;
-#endif
 
 	FindInfo *find_stack = malloc(sizeof(FindInfo));
 	size_t path_len = strlen(path);
@@ -649,27 +610,24 @@ static DWORD __stdcall scan_thread_routine(LPVOID lpParam) {
 		if (!ReleaseMutex(scan_result_mutex)) return 1;
 		if (was_counting_files) goto find_files;
 	}
-#ifdef USE_YARA
-	cleanup_yara();
-#endif
+
 	LOG_PUTS("Scanned successfully");
 	return 0;
 }
 
 /// Returns the handle to the created thread, which should be passed to
-/// CloseHandle after scan_result.is_scanning goes from TRUE to FALSE.
-HANDLE create_scan_thread(char *path, BOOL logging_enabled_) {
-	logging_enabled = logging_enabled_;
+/// `CloseHandle` after `scan_result.is_scanning` goes from `TRUE` to `FALSE`.
+/// Returns `NULL` on failure.
+HANDLE create_scan_thread(char *path) {
+	if (WaitForSingleObject(scan_result_mutex, INFINITE) != WAIT_OBJECT_0) return NULL;
 
-	if (WaitForSingleObject(scan_result_mutex, INFINITE) == WAIT_OBJECT_0) {
-		scan_result.n_total = 0;
-		scan_result.n_scanned = 0;
-		scan_result.n_sus = 0;
-		scan_result.is_scanning = TRUE;
-		scan_result.is_counting_files = TRUE;
+	scan_result.n_total = 0;
+	scan_result.n_scanned = 0;
+	scan_result.n_sus = 0;
+	scan_result.is_scanning = TRUE;
+	scan_result.is_counting_files = TRUE;
 
-		if (!ReleaseMutex(scan_result_mutex)) return NULL;
-	}
+	if (!ReleaseMutex(scan_result_mutex)) return NULL;
 
 	DWORD _tid;
 	return CreateThread(NULL, 0, scan_thread_routine, path, 0, &_tid);
