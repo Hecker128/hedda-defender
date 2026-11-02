@@ -435,7 +435,7 @@ BOOL init_scanner(
 	return TRUE;
 }
 
-/// Helper for `scan_thread_routine`.
+/// Helper for `scan_find_info_or_count_file`.
 /// `scan_result_mutex` must be aquired by caller when calling this.
 static void scan_file(const char *path, const uint16_t *kernel32_ordinals) {
 	scan_result.n_scanned += 1;
@@ -482,18 +482,50 @@ static void scan_file(const char *path, const uint16_t *kernel32_ordinals) {
 	return;
 }
 
-/// Do not call this directly. Use `create_scan_thread` instead.
-static DWORD WINAPI scan_thread_routine(LPVOID lpParam) {
-	const char *path = lpParam;
+/// Helper for `scan_thread_routine`.
+/// Returns `FALSE` on failure.
+static BOOL scan_find_info_or_count_file(FindInfo *find, const uint16_t *kernel32_ordinals) {
+	size_t path_len = strlen(find->path);
 
-	uint16_t kernel32_ordinals[KERNEL32_SUSSYBAKAS_MAX];
-	if (!get_kernel32_ordinals(kernel32_ordinals)) return 1;
+	// "path/*" => "path/file"
+	// "path"   => "path" (= "file")
+	BOOL path_has_wild;
+	if (find->path[path_len - 1] == '*') {
+		path_has_wild = TRUE;
+		size_t file_name_len = strlen(find->data.cFileName);
+		find->path = realloc(find->path, path_len + file_name_len);
+		memcpy(find->path + path_len - 1, find->data.cFileName, file_name_len);
+		find->path[path_len + file_name_len - 1] = 0;
+	} else
+		path_has_wild = FALSE;
 
-	FindInfo *find_stack = malloc(sizeof(FindInfo));
+	if (WaitForSingleObject(scan_result_mutex, INFINITE) != WAIT_OBJECT_0) return FALSE;
+
+	if (scan_result.is_counting_files)
+		scan_result.n_total += 1;
+	else
+		scan_file(find->path, kernel32_ordinals);
+
+	if (!ReleaseMutex(scan_result_mutex)) return FALSE;
+
+	// "path" => "path/*"
+	// "file" => "file"
+	if (path_has_wild) {
+		find->path[path_len - 1] = '*';
+		find->path[path_len] = 0;
+	}
+
+	return TRUE;
+}
+
+/// Helper for `scan_thread_routine`.
+/// Returns `FALSE` on failure.
+static BOOL find_first_file_to_find_stack(FindInfo *find_stack, const char *path) {
 	size_t path_len = strlen(path);
-	if (path_len == 0) return 1;
-
-	find_files:
+	if (path_len == 0) {
+		LOG_PUTS("Length of file path shouldn't be 0.");
+		return FALSE;
+	}
 
 	if (strcmp(path, ".") == 0 || strcmp(path, "..") == 0) {
 		// "."  => "./*".
@@ -505,17 +537,25 @@ static DWORD WINAPI scan_thread_routine(LPVOID lpParam) {
 		find_stack[0].path = malloc(path_len + 1);
 		memcpy(find_stack[0].path, path, path_len + 1);
 	}
+
 	find_stack[0].find = FindFirstFile(find_stack[0].path, &find_stack[0].data);
 	if (find_stack[0].find == INVALID_HANDLE_VALUE) {
-		uint32_t err = GetLastError();
-		if (err == ERROR_ACCESS_DENIED) {
-			LOG_PUTS("Not scanning any files because access was denied.");
-			goto skip_scan;
-		} else {
-			print_win_err(err, "Failed to find file (in %s)", find_stack[0].path);
-			return 1;
-		}
+		LOG_PRINT_WIN_ERR(GetLastError(), "Failed to find file (in %s)", find_stack[0].path);
+		free(find_stack[0].path);
+		return FALSE;
 	}
+
+	return TRUE;
+}
+
+static DWORD WINAPI scan_thread_routine(LPVOID lpParam) {
+	uint16_t kernel32_ordinals[KERNEL32_SUSSYBAKAS_MAX];
+	if (!get_kernel32_ordinals(kernel32_ordinals)) return 1;
+
+	FindInfo *find_stack = malloc(sizeof(FindInfo));
+
+	find_files:
+	if (!find_first_file_to_find_stack(find_stack, lpParam)) return 1;
 	int ext_depth = 0;
 	for (;;) {
 		check_first_find:
@@ -553,43 +593,14 @@ static DWORD WINAPI scan_thread_routine(LPVOID lpParam) {
 						LOG_PRINTF("Skipping file(s) \"%s\" because access was denied.\n", find_stack[ext_depth].path);
 						break;
 					} else {
-						print_win_err(err, "Failed to find file (in %s)", find_stack[ext_depth].path);
+						LOG_PRINT_WIN_ERR(err, "Failed to find file (in %s)", find_stack[ext_depth].path);
 						break;
 					}
 				}
 
 				goto check_first_find;
 			} else {
-				FindInfo *find = &find_stack[ext_depth];
-				size_t path_len = strlen(find->path);
-
-				// "path/*" => "path/file"
-				// "path"   => "path" (= "file")
-				BOOL path_has_wild;
-				if (find->path[path_len - 1] == '*') {
-					path_has_wild = TRUE;
-					size_t file_name_len = strlen(find->data.cFileName);
-					find->path = realloc(find->path, path_len + file_name_len);
-					memcpy(find->path + path_len - 1, find->data.cFileName, file_name_len);
-					find->path[path_len + file_name_len - 1] = 0;
-				} else
-					path_has_wild = FALSE;
-
-				if (WaitForSingleObject(scan_result_mutex, INFINITE) == WAIT_OBJECT_0) {
-					if (scan_result.is_counting_files)
-						scan_result.n_total += 1;
-					else {
-						scan_file(find->path, kernel32_ordinals);
-					}
-					if (!ReleaseMutex(scan_result_mutex)) return 1;
-				}
-
-				// "path" => "path/*"
-				// "file" => "file"
-				if (path_has_wild) {
-					find->path[path_len - 1] = '*';
-					find->path[path_len] = 0;
-				}
+				scan_find_info_or_count_file(&find_stack[ext_depth], kernel32_ordinals);
 			}
 		} while (FindNextFile(find_stack[ext_depth].find, &find_stack[ext_depth].data));
 		
@@ -598,18 +609,18 @@ static DWORD WINAPI scan_thread_routine(LPVOID lpParam) {
 		if (ext_depth-- <= 0) break;
 		if (!FindNextFile(find_stack[ext_depth].find, &find_stack[ext_depth].data)) goto dec_depth;
 	}
-	skip_scan:
 
-	if (WaitForSingleObject(scan_result_mutex, INFINITE) == WAIT_OBJECT_0) {
-		BOOL was_counting_files = scan_result.is_counting_files;
-		if (was_counting_files)
-			scan_result.is_counting_files = FALSE;
-		else
-			scan_result.is_scanning = FALSE;
+	if (WaitForSingleObject(scan_result_mutex, INFINITE) != WAIT_OBJECT_0) return 1;
 
-		if (!ReleaseMutex(scan_result_mutex)) return 1;
-		if (was_counting_files) goto find_files;
-	}
+	BOOL was_counting_files = scan_result.is_counting_files;
+	if (was_counting_files)
+		scan_result.is_counting_files = FALSE;
+	else
+		scan_result.is_scanning = FALSE;
+
+	if (!ReleaseMutex(scan_result_mutex)) return 1;
+
+	if (was_counting_files) goto find_files;
 
 	LOG_PUTS("Scanned successfully");
 	return 0;

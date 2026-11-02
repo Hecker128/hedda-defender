@@ -1,9 +1,9 @@
-:: set USE_MSVCRT=1
+set USE_MSVCRT=1
 set USE_MINGW=1
 set USE_YARA=1
-:: set USE_APPNOTIFICATIONS=1
+set USE_APPNOTIFICATIONS=1
 :: set USE_API_HOOKS=1
-set USE_HEDDAFLT=1
+:: set USE_HEDDAFLT=1
 set USE_ASAN=1
 
 @set CFLAGS=src\gui.c src\util.c -o bin\hedda-defender.exe -Wall -Wextra -Werror=return-type -Wno-unused-parameter -Wno-unused-function -luser32 -lgdi32 -lcomctl32 -lmsi -ladvapi32 -lcrypt32 -g

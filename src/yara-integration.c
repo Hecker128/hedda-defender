@@ -81,6 +81,7 @@ YR_RULES *init_yara(BOOL logging_enabled) {
 /// Returns `FALSE` on failure.
 BOOL yara_scan_file(YR_RULES *yara_rules, const char *path, BOOL *matched, BOOL logging_enabled) {
 	YaraMatchedCallbackUserData user_data = { matched, logging_enabled };
+        *matched = FALSE;
 	int result = yr_rules_scan_file(yara_rules, path, SCAN_FLAGS_FAST_MODE, yara_match_callback, &user_data, 0);
 	if (result == ERROR_COULD_NOT_OPEN_FILE) {
 		LOG_PRINT_WIN_ERR(GetLastError(), "YARA scan failed for \"%s\" because the file couldn't be opened", path);
