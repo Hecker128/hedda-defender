@@ -1,4 +1,5 @@
 #include "util.h"
+#include "scanner.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <windows.h>
@@ -23,7 +24,6 @@ static BOOL logging_enabled;
 /// `*mapping` receives the file mapping object created for this mapping.
 /// `*len` receives the length of the mapping, which is the size of the file.
 /// Returns `FALSE` on failure.
-/// If this function fails, cleanup is done automatically.
 static BOOL map_file(const uint8_t **data, int64_t *len, HANDLE *mapping, HANDLE *file, const char *path) {
 	*file = CreateFile(path, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
 	if (*file == INVALID_HANDLE_VALUE) {
@@ -56,42 +56,40 @@ static BOOL map_file(const uint8_t **data, int64_t *len, HANDLE *mapping, HANDLE
 	return TRUE;
 }
 
-/// Cleanup for resources received from map_file.
+/// Cleanup for resources received from `map_file`.
 static void unmap_file(const uint8_t *data, HANDLE mapping, HANDLE file) {
 	UnmapViewOfFile(data);
 	CloseHandle(mapping);
 	CloseHandle(file);
 }
 
-/// hash: Pointer to where to put the (32-byte) SHA-256 hash.
-/// data: Data to hash.
-/// len:  Length of data.
-/// Returns TRUE if successful.
-/// NOTE: Leaks memory on failure.
-static BOOL sha256_hash(uint8_t *hash, const uint8_t *data, DWORD len) {
-	HCRYPTPROV hp;
-	HCRYPTHASH hh;
-	if (!CryptAcquireContext(&hp, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) return FALSE;
-	if (!CryptCreateHash(hp, CALG_SHA_256, 0, 0, &hh)) return FALSE;
+/// Hashes `data` of length `len` to a (32-byte) SHA-256 hash returned in
+/// `*hash` using `prov`.
+/// Returns FALSE on failure.
+static BOOL sha256_hash(uint8_t *hash, const uint8_t *data, DWORD len, HCRYPTPROV prov) {
+	HCRYPTHASH crypthash;
+	if (!CryptCreateHash(prov, CALG_SHA_256, 0, 0, &crypthash)) return FALSE;
 
-	if (!CryptHashData(hh, data, len, 0)) return FALSE;
+	if (!CryptHashData(crypthash, data, len, 0)) {
+		CryptDestroyHash(crypthash);
+		return FALSE;
+	}
 
 	DWORD hash_len = 32;
-	if (!CryptGetHashParam(hh, HP_HASHVAL, hash, &hash_len, 0)) return FALSE;
+	BOOL ret = CryptGetHashParam(crypthash, HP_HASHVAL, hash, &hash_len, 0);
 
-	CryptDestroyHash(hh);
-	CryptReleaseContext(hp, 0);
-	return TRUE;
+	CryptDestroyHash(crypthash);
+	return ret;
 }
 
-static BOOL sha256_hash_file(uint8_t *hash, const char *path) {
+static BOOL sha256_hash_file(uint8_t *hash, const char *path, HCRYPTPROV prov) {
 	const uint8_t *data;
 	int64_t len;
 	HANDLE mapping;
 	HANDLE file;
 	if (!map_file(&data, &len, &mapping, &file, path)) return FALSE;
 
-	BOOL success = sha256_hash(hash, data, len);
+	BOOL success = sha256_hash(hash, data, len, prov);
 	unmap_file(data, mapping, file);
 
 	return success;
@@ -193,7 +191,7 @@ static const char *kernel32_sus_names[] = {
 	"VirtualAllocEx",
 };
 
-/// Helper function for get_kernel32_ordinals.
+/// Helper function for `get_kernel32_ordinals`.
 static BOOL get_kernel32_ordinals_inner(uint16_t *ordinals, const uint8_t *data) {
 	const PIMAGE_DOS_HEADER dos_header = (PIMAGE_DOS_HEADER)data;
 
@@ -396,23 +394,33 @@ typedef struct {
 	WIN32_FIND_DATA data;
 } FindInfo;
 
-typedef struct {
-	char *path;
-	uint8_t hash[32];
-} FileInfo;
-
-typedef struct {
-	uint64_t n_total;
-	uint64_t n_scanned;
-	uint64_t n_sus;
-	uint64_t n_malicious;
-	FileInfo *malicious_infos;
-	BOOL is_scanning;
-	BOOL is_counting_files;
-} ScanResult;
-
 HANDLE scan_result_mutex = NULL;
 ScanResult scan_result = {0};
+
+/// Acquires `scan_result_mutex`, letting the calling thread use `scan_result`
+/// with other threads running. Always (unless this function fails) call
+/// `release_scan_result` soon after because sharing is caring <3
+/// Returns `NULL` on failure.
+ScanResult *acquire_scan_result() {
+	BOOL result = WaitForSingleObject(scan_result_mutex, INFINITE);
+	if (result == WAIT_ABANDONED) {
+		LOG_PUTS("Scan result mutex was abandoned (this should NOT happen).");
+	} else if (result != WAIT_OBJECT_0) {
+		LOG_PRINTF("Wait for scan result mutex failed. Result: 0x%X.", result);
+		return NULL;
+	}
+	return &scan_result;
+}
+
+/// Releases `scan_result_mutex`.
+/// Returns `FALSE` on failure.
+BOOL release_scan_result() {
+	if (!ReleaseMutex(scan_result_mutex)) {
+		LOG_PRINT_WIN_ERR(GetLastError(), "Failed to release scan result");
+		return FALSE;
+	}
+	return TRUE;
+}
 
 /// To be called by the main thread once, before creating the scan thread or
 /// using `scan_result`.
@@ -437,7 +445,7 @@ BOOL init_scanner(
 
 /// Helper for `scan_find_info_or_count_file`.
 /// `scan_result_mutex` must be aquired by caller when calling this.
-static void scan_file(const char *path, const uint16_t *kernel32_ordinals) {
+static void scan_file(const char *path, const uint16_t *kernel32_ordinals, HCRYPTPROV prov) {
 	scan_result.n_scanned += 1;
 #ifdef USE_YARA
 	BOOL yara_matched;
@@ -449,7 +457,7 @@ static void scan_file(const char *path, const uint16_t *kernel32_ordinals) {
 		info.path = malloc(path_sz);
 		memcpy(info.path, path, path_sz);
 
-		if (!sha256_hash_file(info.hash, path)) {
+		if (!sha256_hash_file(info.hash, path, prov)) {
 			// This error handling behaviour is kinda dumb but I
 			// don't see any reason why it would suddenly fail to
 			// hash anyway.
@@ -484,7 +492,7 @@ static void scan_file(const char *path, const uint16_t *kernel32_ordinals) {
 
 /// Helper for `scan_thread_routine`.
 /// Returns `FALSE` on failure.
-static BOOL scan_find_info_or_count_file(FindInfo *find, const uint16_t *kernel32_ordinals) {
+static BOOL scan_find_info_or_count_file(FindInfo *find, const uint16_t *kernel32_ordinals, HCRYPTPROV prov) {
 	size_t path_len = strlen(find->path);
 
 	// "path/*" => "path/file"
@@ -499,14 +507,14 @@ static BOOL scan_find_info_or_count_file(FindInfo *find, const uint16_t *kernel3
 	} else
 		path_has_wild = FALSE;
 
-	if (WaitForSingleObject(scan_result_mutex, INFINITE) != WAIT_OBJECT_0) return FALSE;
+	if (acquire_scan_result() == NULL) return FALSE;
 
 	if (scan_result.is_counting_files)
 		scan_result.n_total += 1;
 	else
-		scan_file(find->path, kernel32_ordinals);
+		scan_file(find->path, kernel32_ordinals, prov);
 
-	if (!ReleaseMutex(scan_result_mutex)) return FALSE;
+	if (!release_scan_result()) return FALSE;
 
 	// "path" => "path/*"
 	// "file" => "file"
@@ -548,43 +556,62 @@ static BOOL find_first_file_to_find_stack(FindInfo *find_stack, const char *path
 	return TRUE;
 }
 
+/// Helper for `scan_thread_routine`.
+/// `dir_name` is the name of the directory to enter (final part of its path).
+/// The path is derived from it and the current index in `find_stack`.
+static void find_stack_push_dir(FindInfo **find_stack, int *ext_depth, const char *dir_name) {
+	const char *prev_path = (*find_stack)[*ext_depth].path;
+	size_t prev_path_len = strlen(prev_path);
+	char *new_path;
+
+	// prev_path == "path/*" => new_path == "path/dir/*".
+	// prev_path == "path"   => new_path == "path/*" (== "dir/*").
+	if (prev_path[prev_path_len - 1] == '*') {
+		size_t dir_name_len = strlen(dir_name);
+		new_path = malloc(prev_path_len + dir_name_len + sizeof("/"));
+		memcpy(new_path, prev_path, prev_path_len);
+		memcpy(new_path + prev_path_len - 1, dir_name, dir_name_len);
+		memcpy(new_path + prev_path_len - 1 + dir_name_len, "/*", 3);
+	} else {
+		new_path = malloc(prev_path_len + 3);
+		memcpy(new_path, prev_path, prev_path_len);
+		memcpy(new_path + prev_path_len, "/*", 3);
+	}
+
+	*ext_depth += 1;
+	*find_stack = realloc(*find_stack, sizeof(FindInfo) * (1 + *ext_depth));
+	(*find_stack)[*ext_depth].path = new_path;
+}
+
 static DWORD WINAPI scan_thread_routine(LPVOID lpParam) {
+	HCRYPTPROV prov;
+	if (!CryptAcquireContext(&prov, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) return 1;
+
 	uint16_t kernel32_ordinals[KERNEL32_SUSSYBAKAS_MAX];
-	if (!get_kernel32_ordinals(kernel32_ordinals)) return 1;
+	if (!get_kernel32_ordinals(kernel32_ordinals)) {
+		CryptReleaseContext(prov, 0);
+		return 1;
+	}
 
 	FindInfo *find_stack = malloc(sizeof(FindInfo));
 
 	find_files:
-	if (!find_first_file_to_find_stack(find_stack, lpParam)) return 1;
+	if (!find_first_file_to_find_stack(find_stack, lpParam)) {
+		free(find_stack);
+		CryptReleaseContext(prov, 0);
+		return 1;
+	}
 	int ext_depth = 0;
 	for (;;) {
 		check_first_find:
 		do {
 			if (find_stack[ext_depth].data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
 				const char *dir_name = find_stack[ext_depth].data.cFileName;
-				////LOG_PRINTF("DIR (level %d): %s\n", ext_depth, dir_name);
 				if (strcmp(dir_name, ".") == 0 || strcmp(dir_name, "..") == 0) continue;
 				if (find_stack[ext_depth].data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT
 						&& find_stack[ext_depth].data.dwReserved0 == IO_REPARSE_TAG_MOUNT_POINT) continue;
-				size_t dir_name_len = strlen(dir_name);
 
-				const char *prev_path = find_stack[ext_depth].path;
-				size_t prev_path_len = strlen(prev_path);
-				ext_depth += 1;
-				find_stack = realloc(find_stack, sizeof(FindInfo) * (1 + ext_depth));
-
-				// prev_path == "path/*" => new_path == "path/dir/*".
-				// prev_path == "path"   => new_path == "path/*" (== "dir/*").
-				if (prev_path[prev_path_len - 1] == '*') {
-					find_stack[ext_depth].path = malloc(prev_path_len + dir_name_len + sizeof("/"));
-					memcpy(find_stack[ext_depth].path, prev_path, prev_path_len);
-					memcpy(find_stack[ext_depth].path + prev_path_len - 1, dir_name, dir_name_len);
-					memcpy(find_stack[ext_depth].path + prev_path_len - 1 + dir_name_len, "/*", 3);
-				} else {
-					find_stack[ext_depth].path = malloc(prev_path_len + 3);
-					memcpy(find_stack[ext_depth].path, prev_path, prev_path_len);
-					memcpy(find_stack[ext_depth].path + prev_path_len, "/*", 3);
-				}
+				find_stack_push_dir(&find_stack, &ext_depth, dir_name);
 
 				find_stack[ext_depth].find = FindFirstFile(find_stack[ext_depth].path, &find_stack[ext_depth].data);
 				if (find_stack[ext_depth].find == INVALID_HANDLE_VALUE) {
@@ -597,10 +624,11 @@ static DWORD WINAPI scan_thread_routine(LPVOID lpParam) {
 						break;
 					}
 				}
-
+				// Using continue here would call FindNextFile,
+				// ignoring the file found with FindFirstFile.
 				goto check_first_find;
 			} else {
-				scan_find_info_or_count_file(&find_stack[ext_depth], kernel32_ordinals);
+				scan_find_info_or_count_file(&find_stack[ext_depth], kernel32_ordinals, prov);
 			}
 		} while (FindNextFile(find_stack[ext_depth].find, &find_stack[ext_depth].data));
 		
@@ -610,7 +638,11 @@ static DWORD WINAPI scan_thread_routine(LPVOID lpParam) {
 		if (!FindNextFile(find_stack[ext_depth].find, &find_stack[ext_depth].data)) goto dec_depth;
 	}
 
-	if (WaitForSingleObject(scan_result_mutex, INFINITE) != WAIT_OBJECT_0) return 1;
+	if (acquire_scan_result() == NULL) {
+		free(find_stack);
+		CryptReleaseContext(prov, 0);
+		return 1;
+	}
 
 	BOOL was_counting_files = scan_result.is_counting_files;
 	if (was_counting_files)
@@ -618,27 +650,31 @@ static DWORD WINAPI scan_thread_routine(LPVOID lpParam) {
 	else
 		scan_result.is_scanning = FALSE;
 
-	if (!ReleaseMutex(scan_result_mutex)) return 1;
+	if (!release_scan_result()) {
+		free(find_stack);
+		CryptReleaseContext(prov, 0);
+		return 1;
+	}
 
 	if (was_counting_files) goto find_files;
 
 	LOG_PUTS("Scanned successfully");
+	free(find_stack);
+	CryptReleaseContext(prov, 0);
 	return 0;
 }
 
 /// Returns the handle to the created thread, which should be passed to
 /// `CloseHandle` after `scan_result.is_scanning` goes from `TRUE` to `FALSE`.
 /// Returns `NULL` on failure.
+/// Do NOT call this from threads other than the main thread, and never run
+/// multiple scan threads at once.
 HANDLE create_scan_thread(char *path) {
-	if (WaitForSingleObject(scan_result_mutex, INFINITE) != WAIT_OBJECT_0) return NULL;
-
 	scan_result.n_total = 0;
 	scan_result.n_scanned = 0;
 	scan_result.n_sus = 0;
 	scan_result.is_scanning = TRUE;
 	scan_result.is_counting_files = TRUE;
-
-	if (!ReleaseMutex(scan_result_mutex)) return NULL;
 
 	DWORD _tid;
 	return CreateThread(NULL, 0, scan_thread_routine, path, 0, &_tid);

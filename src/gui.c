@@ -5,18 +5,11 @@
 #include <stdint.h>
 #include <math.h>
 #include <string.h>
-#include "scanner.c"
+#include "scanner.h"
+#include "util.h"
 
 #ifdef USE_APPNOTIFICATIONS
-# include "appnotifications.c"
-#endif
-
-#ifdef USE_API_HOOKS
-# include "dynamic.c"
-#endif
-
-#ifdef USE_HEDDAFLT
-# include "heddaflt-user.c"
+# include "appnotifications.h"
 #endif
 
 #ifdef USE_YARA
@@ -27,7 +20,7 @@ static YR_RULES *yaraRules;
 #define ID_TIMER_GUI            2
 #define ID_TIMER_SCAN_UPDATE    3
 
-// Logging enabled for main thread.
+// Logging enabled for GUI (main thread).
 static BOOL logging_enabled = FALSE;
 
 static HANDLE scanThread = NULL;
@@ -43,7 +36,7 @@ static uint64_t totalFiles = 0;
 static uint64_t maliciousFiles = 0;
 static char **maliciousPaths;
 
-static char *rootDir = "C:";
+static char *rootDir;
 
 static RECT getButtonRect(const RECT *rect)
 {
@@ -403,11 +396,6 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
                     return 0;
                 }
 
-                if (scan_result_mutex == NULL) {
-                    showScanStartError(wind);
-                    return 0;
-                }
-
                 scannedFiles = 0;
                 totalFiles = 0;
                 maliciousFiles = 0;
@@ -442,20 +430,20 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
         }
 
         if (wp == ID_TIMER_SCAN_UPDATE && scanning) {
-            DWORD waitResult = WaitForSingleObject(scan_result_mutex, INFINITE);
-            if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_ABANDONED) {
-                scanning = scan_result.is_scanning;
-                countingFiles = scan_result.is_counting_files;
-                totalFiles = scan_result.n_total;
-                scannedFiles = scan_result.n_scanned;
+            ScanResult *scanResult = acquire_scan_result();
+            if (scanResult != NULL) {
+                scanning = scanResult->is_scanning;
+                countingFiles = scanResult->is_counting_files;
+                totalFiles = scanResult->n_total;
+                scannedFiles = scanResult->n_scanned;
 
                 uint64_t maliciousFilesPrev = maliciousFiles;
-                maliciousFiles = scan_result.n_malicious;
+                maliciousFiles = scanResult->n_malicious;
                 if (maliciousFiles != maliciousFilesPrev) {
                     maliciousPaths = realloc(maliciousPaths, maliciousFiles * sizeof(char *));
 
                     for (uint64_t i = maliciousFilesPrev; i < maliciousFiles; i++) {
-                        const char *path = scan_result.malicious_infos[i].path;
+                        const char *path = scanResult->malicious_infos[i].path;
                         size_t pathSize = strlen(path) + 1;
                         maliciousPaths[i] = malloc(pathSize);
                         memcpy(maliciousPaths[i], path, pathSize);
@@ -466,7 +454,7 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
                     InvalidateRect(wind, NULL, FALSE);
                 }
 
-                ReleaseMutex(scan_result_mutex);
+                release_scan_result();
 
                 if (!scanning) {
                     KillTimer(wind, ID_TIMER_GUI);
@@ -566,74 +554,16 @@ static LRESULT CALLBACK windProc(HWND wind, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcA(wind, msg, wp, lp);
 }
 
-static BOOL parse_args(int argc, char **argv)
-{
-    const char *usage =
-        "USAGE: hedda-defender.exe [options]\n"
-        "\n"
-        "OPTIONS:\n"
-        "  -v\t\t- verbose (i.e. enable logging to stdout)\n"
-        "  -r path...\t- root directory for scanning (default is 'C:')";
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-h") == 0) {
-            LOG_PUTS(usage);
-            return FALSE;
-        } else if (strcmp(argv[i], "-v") == 0) {
-            logging_enabled = TRUE;
-        } else if (strcmp(argv[i], "-r") == 0) {
-            if (++i >= argc) {
-                LOG_PUTS(usage);
-                return FALSE;
-            }
-            rootDir = argv[i];
-        }
-    }
-    return TRUE;
-}
-
-int main(int argc, char **argv)
-{
-    if (!parse_args(argc, argv))
-        return 1;
-
+void guiMain(BOOL _logging_enabled, char *_rootDir,
 #ifdef USE_YARA
-    yaraRules = init_yara(logging_enabled);
-    if (yaraRules == NULL)
-        return 1;
+        YR_RULES *_yaraRules
 #endif
-
-    if (!init_scanner(
-                logging_enabled
+) {
+    logging_enabled = _logging_enabled;
+    rootDir = _rootDir;
 #ifdef USE_YARA
-                , yaraRules
+    yaraRules = _yaraRules;
 #endif
-    )) {
-        LOG_PUTS("Failed to initialize scanner.");
-        return 1;
-    }
-
-#ifdef USE_APPNOTIFICATIONS
-    HRESULT result = init_appnotifications(logging_enabled);
-    if (!SUCCEEDED(result)) return result;
-#endif
-#ifdef USE_API_HOOKS
-    HANDLE hookerThread = create_dynamic_hook_injector_thread(logging_enabled);
-    if (hookerThread == NULL)
-        LOG_PUTS("API hook injection will not be done because thread creation failed.");
-#endif
-#ifdef USE_HEDDAFLT
-    HANDLE heddafltMsgThread = create_heddaflt_message_handler_thread(
-            logging_enabled
-#ifdef USE_YARA
-            , yaraRules
-#endif
-    );
-    if (heddafltMsgThread == NULL)
-        LOG_PUTS("HeddaFlt will not be used because thread creation failed.");
-#endif
-
-    maliciousPaths = malloc(sizeof(*maliciousPaths));
 
     WNDCLASSA wc = {0};
     wc.hCursor = LoadCursorA(NULL, IDC_ARROW);
@@ -645,8 +575,7 @@ int main(int argc, char **argv)
 
     if (!RegisterClassA(&wc)) {
         LOG_PUTS("Failed to register window class.");
-        CloseHandle(scan_result_mutex);
-        return 1;
+        return;
     }
 
     HWND wind = CreateWindowExA(
@@ -657,9 +586,10 @@ int main(int argc, char **argv)
 
     if (!wind) {
         LOG_PUTS("Failed to create window.");
-        CloseHandle(scan_result_mutex);
-        return 1;
+        return;
     }
+
+    maliciousPaths = malloc(sizeof(*maliciousPaths));
 
     ShowWindow(wind, SW_SHOW);
     UpdateWindow(wind);
@@ -670,28 +600,9 @@ int main(int argc, char **argv)
         DispatchMessageA(&msg);
     }
 
-    if (scan_result_mutex != NULL) {
-        CloseHandle(scan_result_mutex);
-        scan_result_mutex = NULL;
-    }
-
     for (uint64_t i = 0; i < maliciousFiles; i++)
         free(maliciousPaths[i]);
     free(maliciousPaths);
-
-#ifdef USE_HEDDAFLT
-    if (heddafltMsgThread != NULL)
-        CloseHandle(heddafltMsgThread);
-#endif
-#ifdef USE_API_HOOKS
-    if (hookerThread != NULL)
-        CloseHandle(hookerThread);
-#endif
-#ifdef USE_APPNOTIFICATIONS
-    uninit_appnotifications();
-#endif
-
-    return (int)msg.wParam;
 }
 
 // vim: tabstop=4 shiftwidth=4 expandtab

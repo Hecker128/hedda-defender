@@ -6,7 +6,7 @@ set USE_APPNOTIFICATIONS=1
 :: set USE_HEDDAFLT=1
 set USE_ASAN=1
 
-@set CFLAGS=src\gui.c src\util.c -o bin\hedda-defender.exe -Wall -Wextra -Werror=return-type -Wno-unused-parameter -Wno-unused-function -luser32 -lgdi32 -lcomctl32 -lmsi -ladvapi32 -lcrypt32 -g
+@set CFLAGS=src\main.c src\scanner.c src\util.c -o bin\hedda-defender.exe -Wall -Wextra -Werror=return-type -Wno-unused-parameter -Wno-unused-function -luser32 -lgdi32 -lcomctl32 -lmsi -ladvapi32 -lcrypt32 -g
 
 @setlocal EnableDelayedExpansion
 
@@ -30,7 +30,7 @@ set USE_ASAN=1
 	set PACKAGES_DIR=%USERPROFILE%\.nuget\packages
 	set FOUNDATION_DIR=%USERPROFILE%\.nuget\packages\microsoft.windowsappsdk.foundation\2.6.4
 	set RUNTIME_DIR=%USERPROFILE%\.nuget\packages\microsoft.windowsappsdk.runtime\2.6.4
-	set CFLAGS=%CFLAGS% -DUSE_APPNOTIFICATIONS -I"!FOUNDATION_DIR!\include" -I"!RUNTIME_DIR!\include" -L"!FOUNDATION_DIR!\lib\native\x64" -lRuntimeObject -lMicrosoft.WindowsAppRuntime.Bootstrap
+	set CFLAGS=%CFLAGS% -DUSE_APPNOTIFICATIONS src\appnotifications.c -I"!FOUNDATION_DIR!\include" -I"!RUNTIME_DIR!\include" -L"!FOUNDATION_DIR!\lib\native\x64" -lRuntimeObject -lMicrosoft.WindowsAppRuntime.Bootstrap
 
 	copy "!FOUNDATION_DIR!\runtimes\win-x64\native\Microsoft.WindowsAppRuntime.Bootstrap.dll" bin
 	if !ERRORLEVEL! NEQ 0 (
